@@ -1,4 +1,4 @@
-# scala_learn — Kyo ArrowEffect Agent Loop
+# helix — Kyo ArrowEffect Agent Loop
 
 基于 [Kyo 0.19](https://getkyo.io/) `ArrowEffect` 构建的 ReAct agent 框架。Tool 和 LLM 两侧架构对称，`def / invoke / impl` 三层命名贯穿所有 effect，横切关注点走 middleware，状态转移走 L4 正交小 effect，replay / reflexion 这类控制结构走 L5 meta-loop。
 
