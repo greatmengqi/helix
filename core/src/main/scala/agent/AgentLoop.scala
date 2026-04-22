@@ -57,38 +57,7 @@ object Agent {
         else
           for {
             response <- LLM.complete(history)
-            outcome <- response match {
-              case LLMResponse.Answer(text) =>
-                // Answer 也入 history——调用方能拿到完整 session 流水
-                val finalHistory = history :+ Message(Role.Assistant, text)
-                IO(
-                  Loop.done[List[Message], Int, (String, List[Message])](
-                    (text, finalHistory)
-                  )
-                )
-              case LLMResponse.ToolCalls(invocations) =>
-                // 串行依次执行每个 invocation，保留原序拼回 history。
-                // remaining - 1 是按"一次 LLM 推理步"扣，和工具数量无关。
-                Kyo
-                  .foreach(invocations) { inv =>
-                    Tool.call(inv.name, inv.args).map(out => (inv, out))
-                  }
-                  .map { results =>
-                    val newMsgs = results.toList.flatMap { case (inv, out) =>
-                      List(
-                        Message(
-                          Role.Assistant,
-                          s"CALL ${inv.name}(${inv.args})"
-                        ),
-                        Message(Role.Tool, out)
-                      )
-                    }
-                    Loop.continue[List[Message], Int, (String, List[Message])](
-                      history ++ newMsgs,
-                      remaining - 1
-                    )
-                  }
-            }
+            outcome  <- decideNext(response, history, remaining)
           } yield outcome
       }
       elapsedMs <- IO((java.lang.System.nanoTime() - startedNanos) / 1_000_000)
@@ -176,4 +145,64 @@ object Agent {
       }
       _ <- Log.info("session.end")
     } yield ()
+
+  // ====================== L4 suspend-point 预备（§6.3）======================
+  //
+  // 下面两个 private 函数是**命名重构**，不引入任何 effect，不改 loop 行为。
+  // 目的是给未来要补的 ArrowEffect（HistoryRewrite / AgentHalt / ResponseHook 等）
+  // 锚定插入位置：提升这些函数的**入口或返回前**为 ArrowEffect.suspend 点。
+  //
+  // 对应 LangChain AgentMiddleware 的 hook 布局（但不借用其 god-ADT）：
+  //   - decideNext 入口：before_agent_decision（halt/goto='end' 类）
+  //   - appendTurn 返回前：after_tool / history patch 类
+
+  /** 决定当前 LLM 响应后 agent 的下一步：终结 or 继续。
+    *
+    * Answer 分支：把 Assistant 终答 append 入 history 后 `Loop.done`。 ToolCalls
+    * 分支：串行执行每个 invocation（保留原序），结果拼回 history 后 `Loop.continue`。
+    * `remaining - 1` 是按"一次 LLM 推理步"扣，和工具数量无关。
+    *
+    * 未来补 `AgentHalt` effect 时，suspend 点放在本方法入口——halt 命中则忽略 response 直接
+    * `Loop.done`。
+    */
+  private def decideNext(
+      response: LLMResponse,
+      history: List[Message],
+      remaining: Int
+  ) = response match {
+    case LLMResponse.Answer(text) =>
+      // Answer 也入 history——调用方能拿到完整 session 流水
+      val finalHistory = history :+ Message(Role.Assistant, text)
+      IO(
+        Loop.done[List[Message], Int, (String, List[Message])](
+          (text, finalHistory)
+        )
+      )
+    case LLMResponse.ToolCalls(invocations) =>
+      Kyo
+        .foreach(invocations) { inv =>
+          Tool.call(inv.name, inv.args).map(out => (inv, out))
+        }
+        .map { results =>
+          val newMsgs = results.toList.flatMap { case (inv, out) =>
+            List(
+              Message(Role.Assistant, s"CALL ${inv.name}(${inv.args})"),
+              Message(Role.Tool, out)
+            )
+          }
+          Loop.continue[List[Message], Int, (String, List[Message])](
+            appendTurn(history, newMsgs),
+            remaining - 1
+          )
+        }
+  }
+
+  /** Tool 执行产出的 messages 如何 append 回 history。
+    *
+    * 当前：纯拼接。未来若要允许 middleware 改写（tool 结果压缩 / 过滤敏感信息 / 合并同名调用），suspend 点放在本方法内。
+    */
+  private def appendTurn(
+      history: List[Message],
+      newMsgs: List[Message]
+  ): List[Message] = history ++ newMsgs
 }
