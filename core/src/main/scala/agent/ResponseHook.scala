@@ -11,17 +11,17 @@ import kyo.kernel.*
   * 对应 LangChain `AgentMiddleware.after_model(state)`——LLM 说完话、agent 决策之前的窗口。
   *
   * 消费者（示例）：
-  *   - `runIdentity`  透传，默认
-  *   - `runMap(f)`    generic 变换——可以：
-  *       - `Answer("") → Answer("<empty>")` 避免空回答污染
-  *       - `ToolCalls(invs) → ToolCalls(invs.filter(allowList.contains))` 过滤非法工具
-  *       - `Answer(text) → ToolCalls(...)` 强制工具调用（改变控制流！）
+  *   - `runIdentity` 透传，默认
+  *   - `runMap(f)` generic 变换——可以：
+  *     - `Answer("") → Answer("<empty>")` 避免空回答污染
+  *     - `ToolCalls(invs) → ToolCalls(invs.filter(allowList.contains))` 过滤非法工具
+  *     - `Answer(text) → ToolCalls(...)` 强制工具调用（改变控制流！）
   *
   * **不支持**：回放/重试 LLM 调用——handler 拿不到 history 上下文，没法重新 `LLM.complete`。 真要这种能力属于
   * L5 级，需要状态机结构化抽象。
   *
-  * **和 `HistoryRewrite` / `AgentHalt` 的正交性**：三者独立 wire，顺序互不影响语义
-  * （顺序仅改变 suspend 触发时机）。
+  * **和 `HistoryRewrite` / `AgentHalt` 的正交性**：三者独立 wire，顺序互不影响语义 （顺序仅改变 suspend
+  * 触发时机）。
   */
 sealed trait ResponseHook
     extends ArrowEffect[Const[LLMResponse], Const[LLMResponse]]
@@ -32,7 +32,8 @@ object ResponseHook {
     * 等回一个（可能被改写的）response。
     *
     * **三层角色**（source-level）：
-    *   - **def**：`sealed trait ResponseHook extends ArrowEffect[...]`——效应契约（type）
+    *   - **def**：`sealed trait ResponseHook extends
+    *     ArrowEffect[...]`——效应契约（type）
     *   - **invoke**：`def invoke(r)`（本方法）——调用方，`ArrowEffect.suspend` 的封装
     *   - **impl**：`def implIdentity` / `def implMap(f)`——handler 实现（策略）
     */
@@ -42,17 +43,19 @@ object ResponseHook {
   ): LLMResponse < ResponseHook =
     ArrowEffect.suspend[Any](tag, r)
 
-  /** **impl**（identity）：透传，等价于"不启用 response 改写"。默认 wire。 */
+  /** **impl**（identity）：透传，等价于"不启用 response 改写"。默认 wire。
+    */
   inline def implIdentity[A, S](v: A < (ResponseHook & S))(using
       inline frame: Frame,
       inline tag: Tag[ResponseHook]
   ): A < S =
     ArrowEffect.handle(tag, v)([C] => (r, cont) => cont(r))
 
-  /** **impl**（map）：generic 变换——用户提供的 `LLMResponse => LLMResponse` 函数每次被应用到 LLM 返回值上。
+  /** **impl**（map）：generic 变换——用户提供的 `LLMResponse => LLMResponse` 函数每次被应用到 LLM
+    * 返回值上。
     *
-    * 特殊变换场景自己写 `f`。Framework 不提供 `implRewriteEmpty` / `implFilterTools`
-    * 等预制 handler——消费者自己最清楚要改什么，framework 只提供接入点。
+    * 特殊变换场景自己写 `f`。Framework 不提供 `implRewriteEmpty` / `implFilterTools` 等预制
+    * handler——消费者自己最清楚要改什么，framework 只提供接入点。
     */
   inline def implMap[A, S](f: LLMResponse => LLMResponse)(
       v: A < (ResponseHook & S)

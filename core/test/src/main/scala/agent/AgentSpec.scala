@@ -830,10 +830,18 @@ class AgentSpec extends munit.FunSuite {
         case other                 => other
       }
     )
-    assertEquals(r, Result.Success(("HELLO", List(
-      Message(Role.User, "q"),
-      Message(Role.Assistant, "HELLO")
-    ))))
+    assertEquals(
+      r,
+      Result.Success(
+        (
+          "HELLO",
+          List(
+            Message(Role.User, "q"),
+            Message(Role.Assistant, "HELLO")
+          )
+        )
+      )
+    )
   }
 
   test(
@@ -980,7 +988,9 @@ class AgentSpec extends munit.FunSuite {
     }
   }
 
-  test("loopWithReplay: judge injects hint → round 2 LLM sees hint in history") {
+  test(
+    "loopWithReplay: judge injects hint → round 2 LLM sees hint in history"
+  ) {
     // judge 首轮判不够，注入 "elaborate"——LLM 第二次调用应该看到前一轮的 Assistant 终答 + hint
     val llm = new RecordingLLM(
       List(
@@ -1103,8 +1113,11 @@ class AgentSpec extends munit.FunSuite {
       }
     )
     assert(r.isSuccess)
-    assertEquals(captured.last, Message(Role.Assistant, "final"),
-      "judge 看到的 history 末尾是本轮 Assistant 终答")
+    assertEquals(
+      captured.last,
+      Message(Role.Assistant, "final"),
+      "judge 看到的 history 末尾是本轮 Assistant 终答"
+    )
   }
 
   test(
@@ -1114,9 +1127,9 @@ class AgentSpec extends munit.FunSuite {
     // judge 无条件前 N 轮都注入，模拟"必须多问几次"的强制流程。
     val llm = new RecordingLLM(
       List(
-        LLMResponse.Answer("done"),          // 想结束
+        LLMResponse.Answer("done"), // 想结束
         LLMResponse.Answer("still thinking"), // 被 judge 拉回第 2 轮
-        LLMResponse.Answer("really done")     // 第 3 轮 judge 放过
+        LLMResponse.Answer("really done") // 第 3 轮 judge 放过
       )
     )
     val round = new java.util.concurrent.atomic.AtomicInteger(0)
@@ -1236,16 +1249,18 @@ class AgentSpec extends munit.FunSuite {
       judge = (_, hist) =>
         // 只有 history 里见过 weather 工具结果才继续
         if (
-          hist.exists(m =>
-            m.role == Role.Tool && m.content.contains("sunny")
-          )
+          hist.exists(m => m.role == Role.Tool && m.content.contains("sunny"))
         ) Some(Message(Role.System, "double-check please"))
         else None
     )
     r match {
       case Result.Success((ans, _)) =>
         assertEquals(ans, "verified")
-        assertEquals(llm.seen.size, 3, "round 1 两次 (tool + answer) + round 2 一次")
+        assertEquals(
+          llm.seen.size,
+          3,
+          "round 1 两次 (tool + answer) + round 2 一次"
+        )
       case other => fail(s"expected Success, got $other")
     }
   }
