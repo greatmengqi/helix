@@ -183,7 +183,7 @@ def loop(initialHistory: List[Message], maxSteps: Int)
     initialHistory, maxSteps
   ) { (history, remaining) =>
     for {
-      rewritten <- HistoryRewrite.apply(history)       // 允许外部压缩 / 改写
+      rewritten <- HistoryRewrite.rewrite(history)     // 允许外部压缩 / 改写
       halt      <- AgentHalt.check()                   // 允许外部请求早停
       outcome   <- halt match
         case Some(reason) =>
@@ -324,7 +324,7 @@ val composedRewrite = (v: A < (HistoryRewrite & S)) =>
 
 可以**现在就做**的零成本预备：
 
-1. `Agent.loop` body 里的 `history ++ newMsgs` 提成命名函数 `appendTurn(history, results)`——方便未来提升为 `HistoryRewrite.apply(history)` suspend 点
+1. `Agent.loop` body 里的 `history ++ newMsgs` 提成命名函数 `appendTurn(history, results)`——方便未来提升为 `HistoryRewrite.rewrite(history)` suspend 点
 2. `Loop.done(...)` / `Loop.continue(...)` 的决策点抽成命名函数 `decideNext(response, ctx)`——方便未来插入 `AgentHalt.check()` 等 effect
 3. **不**提前引入任何 L4 effect——哪怕只是一个 `AgentHalt`。正交小 effect 方案的前提是**每个 effect 都有真实消费者驱动**，没消费者的 effect 即使"只有一个 input/output"也是空抽象
 

@@ -61,7 +61,7 @@ object Agent {
           for {
             // L4 before_model hook：handler 可改写 history（截断 / 压缩 / 注入 system）。
             // runIdentity 下 rewritten === history；runKeepLast(n) 下裁成尾部 n 条。
-            rewritten <- HistoryRewrite.apply(history)
+            rewritten <- HistoryRewrite.rewrite(history)
             // L4 goto='end' hook：handler 返回 Some(reason) 则跳过 LLM 直接终止。
             // runNever 下永远 None，行为等价于不启用 halt；runOn(guard) 可按外部 state 决策。
             haltOpt   <- AgentHalt.check()
@@ -79,7 +79,7 @@ object Agent {
                   raw      <- LLM.complete(rewritten)
                   // L4 after_model hook：handler 可改写 LLM 返回值
                   // （空答案回落默认 / 过滤非法工具 / 强制工具调用）。
-                  response <- ResponseHook.apply(raw)
+                  response <- ResponseHook.hook(raw)
                   // decideNext 用 rewritten 作为基底 append——若 handler 做了压缩，
                   // 后续 session history 也相应收敛（compaction 语义，而非纯 view）。
                   decided  <- decideNext(response, rewritten, remaining)

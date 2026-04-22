@@ -26,7 +26,14 @@ sealed trait AgentHalt extends ArrowEffect[Const[Unit], Const[Option[String]]]
 
 object AgentHalt {
 
-  /** raise 一次 halt check：每轮主流程入口调一次，handler 决定 `Some(reason)` 早停或 `None` 继续。 */
+  /** **invoke**：raise 一次 halt check——每轮主流程入口调一次，handler 决定
+    * `Some(reason)` 早停或 `None` 继续。
+    *
+    * **三层角色**（source-level）：
+    *   - **def**：`sealed trait AgentHalt extends ArrowEffect[...]`——效应契约（type）
+    *   - **invoke**：`def check()`（本方法）——调用方，`ArrowEffect.suspend` 的 domain 动词封装
+    *   - **impl**：`def runNever` / `def runOn(guard)`——handler 实现（策略）
+    */
   inline def check()(using
       inline frame: Frame,
       inline tag: Tag[AgentHalt]

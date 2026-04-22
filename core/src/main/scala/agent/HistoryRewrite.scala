@@ -27,11 +27,17 @@ sealed trait HistoryRewrite
 
 object HistoryRewrite {
 
-  /** raise 一次 history 改写请求：把当前 history 交给 handler， 等回一个（可能被改写的）history。
+  /** **invoke**：raise 一次 history 改写请求——把当前 history 交给 handler， 等回一个（可能被改写的）history。
     *
     * handler 可以压缩、裁剪、注入 system 消息；透传（runIdentity）时行为不变。
+    *
+    * **三层角色**（source-level）：
+    *   - **def**：`sealed trait HistoryRewrite extends ArrowEffect[...]`——效应契约（type）
+    *   - **invoke**：`def rewrite(h)`（本方法）——调用方，`ArrowEffect.suspend` 的 domain 动词封装
+    *   - **impl**：`def runIdentity` / `def runKeepLast`——handler 实现（策略），每加一个 handler
+    *     就是一个新的 impl，不改 def 也不改 invoke
     */
-  inline def apply(h: List[Message])(using
+  inline def rewrite(h: List[Message])(using
       inline frame: Frame,
       inline tag: Tag[HistoryRewrite]
   ): List[Message] < HistoryRewrite =

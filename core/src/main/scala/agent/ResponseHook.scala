@@ -28,8 +28,15 @@ sealed trait ResponseHook
 
 object ResponseHook {
 
-  /** raise 一次 response 改写请求：LLM 返回的 raw response 交给 handler，等回一个（可能被改写的）response。 */
-  inline def apply(r: LLMResponse)(using
+  /** **invoke**：raise 一次 response 改写请求——LLM 返回的 raw response 交给 handler，
+    * 等回一个（可能被改写的）response。
+    *
+    * **三层角色**（source-level）：
+    *   - **def**：`sealed trait ResponseHook extends ArrowEffect[...]`——效应契约（type）
+    *   - **invoke**：`def hook(r)`（本方法）——调用方，`ArrowEffect.suspend` 的 domain 动词封装
+    *   - **impl**：`def runIdentity` / `def runMap(f)`——handler 实现（策略）
+    */
+  inline def hook(r: LLMResponse)(using
       inline frame: Frame,
       inline tag: Tag[ResponseHook]
   ): LLMResponse < ResponseHook =

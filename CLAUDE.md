@@ -59,7 +59,17 @@ core/src/main/scala/agent/
 
 **`AgentHalt` vs `maxSteps`**：`maxSteps` 是硬上限（超限 `Abort.fail`，调用方异常路径），`AgentHalt` 是软终止（`Loop.done` 返回 reason 作为 answer，正常路径）。两者正交共存。
 
-**L4 的 compaction 语义**（和 LangChain 共享）：`HistoryRewrite.apply(history)` 返回的 `rewritten` 成为当前 turn 的 history 基底——`decideNext` / `appendTurn` 都用 rewritten。若 handler 做了压缩，后续 session history 随之收敛，不是纯 view。
+**L4 的 compaction 语义**（和 LangChain 共享）：`HistoryRewrite.rewrite(history)` 返回的 `rewritten` 成为当前 turn 的 history 基底——`decideNext` / `appendTurn` 都用 rewritten。若 handler 做了压缩，后续 session history 随之收敛，不是纯 view。
+
+**命名约定**（所有 ArrowEffect 通用的 **def / invoke / impl** 三层角色）：
+
+| 层 | 对应代码 | 职责 |
+|---|---|---|
+| **def** | `sealed trait Xxx extends ArrowEffect[Const[In], Const[Out]]` | 效应契约（type）——命名通道、钉死 in/out 类型 |
+| **invoke** | `object Xxx.<verb>(...)` — 如 `Tool.call` / `LLM.complete` / `HistoryRewrite.rewrite` / `AgentHalt.check` / `ResponseHook.hook` | 调用方（`ArrowEffect.suspend` 的 domain 动词封装）——业务代码"发起一次效应"的入口 |
+| **impl** | `object Xxx.run*(...)` — 如 `Tool.run` / `HistoryRewrite.runKeepLast` / `AgentHalt.runOn` / `ResponseHook.runMap` | 实现方（`ArrowEffect.handle` 的策略）——每加一个 handler 是加一个 impl，不改 def 也不改 invoke |
+
+一个 effect 的 def 和 invoke 各只有一个（framework 作者写），impl 可以有 N 个（消费者按需写）。这正是"控制反转"在代数效应下的具象：**def + invoke 固定，impl 可替换 = 同一段业务代码在不同 wire 下展现不同行为**。
 
 **L4 wire**：和 L2/L3 同构，pipe 链叠加。每个 effect 必须显式 wire（Kyo 不提供 ambient 默认 handler），签名即能力清单：
 
