@@ -9,24 +9,44 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  MILL_VERSION: "1.1.5"
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: coursier/cache-action@v6
-
-      - uses: coursier/setup-action@v1
+      - uses: actions/setup-java@v4
         with:
-          jvm: temurin:21
-          apps: mill:1.1.5
+          distribution: temurin
+          java-version: '21'
+
+      # Mill 1.x 的 coursier app channel（mill-dev artifact）已停更，
+      # 改用官方 Maven Central 上的 mill-dist launcher 脚本，版本硬编码在 MILL_VERSION env。
+      - name: Install mill
+        run: |
+          curl -fsSL -o ./mill "https://repo1.maven.org/maven2/com/lihaoyi/mill-dist/${MILL_VERSION}/mill-dist-${MILL_VERSION}-mill.sh"
+          chmod +x ./mill
+          ./mill --version
+
+      - name: Cache mill + coursier
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.mill
+            ~/.cache/coursier
+            out
+          key: ${{ runner.os }}-mill-${{ env.MILL_VERSION }}-${{ hashFiles('build.mill') }}
+          restore-keys: |
+            ${{ runner.os }}-mill-${{ env.MILL_VERSION }}-
 
       - name: Check scalafmt
-        run: mill __.checkFormat
+        run: ./mill __.checkFormat
 
       - name: Compile
-        run: mill core.compile
+        run: ./mill core.compile
 
       - name: Test
-        run: mill core.test
+        run: ./mill core.test
