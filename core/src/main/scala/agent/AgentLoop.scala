@@ -39,7 +39,8 @@ object Agent {
       initialHistory: List[Message],
       maxSteps: Int
   ): (String, List[Message]) <
-    (LLM & Tool & HistoryRewrite & AgentHalt & IO & Abort[Throwable]) =
+    (LLM & Tool & HistoryRewrite & AgentHalt & ResponseHook & IO &
+      Abort[Throwable]) =
     for {
       _ <- Log.info(
         s"loop.start history_size=${initialHistory.size} max_steps=$maxSteps"
@@ -49,7 +50,8 @@ object Agent {
         List[Message],
         Int,
         (String, List[Message]),
-        LLM & Tool & HistoryRewrite & AgentHalt & IO & Abort[Throwable]
+        LLM & Tool & HistoryRewrite & AgentHalt & ResponseHook & IO &
+          Abort[Throwable]
       ](initialHistory, maxSteps) { (history, remaining) =>
         if (remaining <= 0)
           Abort.fail(
@@ -74,7 +76,10 @@ object Agent {
                 )
               case None =>
                 for {
-                  response <- LLM.complete(rewritten)
+                  raw      <- LLM.complete(rewritten)
+                  // L4 after_model hook：handler 可改写 LLM 返回值
+                  // （空答案回落默认 / 过滤非法工具 / 强制工具调用）。
+                  response <- ResponseHook.apply(raw)
                   // decideNext 用 rewritten 作为基底 append——若 handler 做了压缩，
                   // 后续 session history 也相应收敛（compaction 语义，而非纯 view）。
                   decided  <- decideNext(response, rewritten, remaining)
@@ -94,7 +99,9 @@ object Agent {
   def loop(
       userInput: String,
       maxSteps: Int = DefaultMaxSteps
-  ): String < (LLM & Tool & HistoryRewrite & AgentHalt & IO & Abort[Throwable]) =
+  ): String <
+    (LLM & Tool & HistoryRewrite & AgentHalt & ResponseHook & IO &
+      Abort[Throwable]) =
     loop(List(Message(Role.User, userInput)), maxSteps).map(_._1)
 
   /** 无限主循环（REPL）：读一行 → 带累计 history 跑一次 agent → 打印 → 继续读下一行。
@@ -147,12 +154,13 @@ object Agent {
               for {
                 // Per-turn discharge：Tool.run / LLM.run 在 Abort.run 内层应用，让 Abort.run
                 // 的作用域能 catch 它们 handler 回调里 raise 的 Abort。三分支 match 决定下一步状态。
-                // repl 内部默认把 L4 effects 都装配为 identity（HistoryRewrite.runIdentity /
-                // AgentHalt.runNever）。需要 custom 策略的调用方应该绕过 repl 自己写 runner，
-                // 或等 repl overload 把 handler 作为参数暴露出来。
+                // repl 内部默认把所有 L4 effects 装配为 identity（HistoryRewrite.runIdentity /
+                // AgentHalt.runNever / ResponseHook.runIdentity）。需要 custom 策略的调用方
+                // 应该绕过 repl 自己写 runner，或等 repl overload 把 handler 暴露出来。
                 resultR <- loop(nextHistory, DefaultMaxSteps)
                   .pipe(HistoryRewrite.runIdentity(_))
                   .pipe(AgentHalt.runNever(_))
+                  .pipe(ResponseHook.runIdentity(_))
                   .pipe(Tool.run(registry))
                   .pipe(LLM.run(llm))
                   .pipe(Abort.run[Throwable](_))

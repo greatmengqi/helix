@@ -36,6 +36,7 @@ core/src/main/scala/agent/
 ├── LLM.scala             — LLMResponse / LLMClient / LLM effect / object LLM / LLMMiddleware
 ├── HistoryRewrite.scala  — L4 effect：before_model hook，runIdentity / runKeepLast
 ├── AgentHalt.scala       — L4 effect：goto='end' hook，runNever / runOn
+├── ResponseHook.scala    — L4 effect：after_model hook，runIdentity / runMap
 └── AgentApp.scala        — 可运行 demo（HeuristicLLM + DemoTools + REPL）
 ```
 
@@ -54,7 +55,7 @@ core/src/main/scala/agent/
 |---|---|---|---|
 | `HistoryRewrite` | 每次 `LLM.complete` 之前 | `before_model` / `modify_model_request` | `runIdentity` / `runKeepLast(n)` |
 | `AgentHalt` | `HistoryRewrite` 之后、`LLM.complete` 之前 | `Command(goto='end')` | `runNever` / `runOn(guard)` |
-| _未来_ `ResponseHook` | `LLM.complete` 之后 | `after_model` | — |
+| `ResponseHook` | `LLM.complete` 之后、`decideNext` 之前 | `after_model` | `runIdentity` / `runMap(f)` |
 
 **`AgentHalt` vs `maxSteps`**：`maxSteps` 是硬上限（超限 `Abort.fail`，调用方异常路径），`AgentHalt` 是软终止（`Loop.done` 返回 reason 作为 answer，正常路径）。两者正交共存。
 
@@ -66,10 +67,13 @@ core/src/main/scala/agent/
 Agent.loop(...)
   .pipe(HistoryRewrite.runKeepLast(20)(_))   // L4 改写
   .pipe(AgentHalt.runOn(budgetGuard)(_))     // L4 早停
+  .pipe(ResponseHook.runMap(filterTools)(_)) // L4 response 改写
   .pipe(Tool.run(registry))                  // L3 discharge
   .pipe(LLM.run(llmClient))                  // L3 discharge
   ...
 ```
+
+**`ResponseHook` 限制**：handler 拿不到 history 上下文，能做 `LLMResponse => LLMResponse` transform（识别空答案、过滤非法工具、强制转 ToolCalls），**不能**回放 LLM——重放 LLM 属 L5 级，需要状态机结构化抽象。
 
 **Agent.loop 状态**：
 - 主版 `loop(initialHistory, maxSteps): (String, List[Message]) < (LLM & Tool & IO & Abort[Throwable])`——入参 history、返回(答案, 含 tool 轨迹与终答的完整 history)

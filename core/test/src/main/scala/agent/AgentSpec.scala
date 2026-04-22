@@ -62,6 +62,7 @@ class AgentSpec extends munit.FunSuite {
       .loop(input, maxSteps)
       .pipe(HistoryRewrite.runIdentity(_))
       .pipe(AgentHalt.runNever(_))
+      .pipe(ResponseHook.runIdentity(_))
       .pipe(Tool.run(registry))
       .pipe(LLM.run(llm))
       .pipe(runSilent(_))
@@ -351,6 +352,7 @@ class AgentSpec extends munit.FunSuite {
           .loop(initialHistory, maxSteps)
           .pipe(HistoryRewrite.runIdentity(_))
           .pipe(AgentHalt.runNever(_))
+          .pipe(ResponseHook.runIdentity(_))
           .pipe(Tool.run(registry))
           .pipe(LLM.run(llm))
       )
@@ -371,6 +373,7 @@ class AgentSpec extends munit.FunSuite {
           .loop(initialHistory, maxSteps)
           .pipe(HistoryRewrite.runKeepLast(n)(_))
           .pipe(AgentHalt.runNever(_))
+          .pipe(ResponseHook.runIdentity(_))
           .pipe(Tool.run(registry))
           .pipe(LLM.run(llm))
       )
@@ -391,6 +394,28 @@ class AgentSpec extends munit.FunSuite {
           .loop(initialHistory, maxSteps)
           .pipe(HistoryRewrite.runIdentity(_))
           .pipe(AgentHalt.runOn(guard)(_))
+          .pipe(ResponseHook.runIdentity(_))
+          .pipe(Tool.run(registry))
+          .pipe(LLM.run(llm))
+      )
+    Abort.run[Throwable](IO.Unsafe.run(handled)).eval
+  }
+
+  /** ResponseHook 测试专用：把 f 作为 response 变换 handler 跑 loop。 */
+  private def runLoopWithResponseMap(
+      llm: LLMClient,
+      registry: ToolRegistry,
+      initialHistory: List[Message],
+      f: LLMResponse => LLMResponse,
+      maxSteps: Int = 6
+  ): Result[Throwable, (String, List[Message])] = {
+    val handled: (String, List[Message]) < (IO & Abort[Throwable]) =
+      runSilent(
+        Agent
+          .loop(initialHistory, maxSteps)
+          .pipe(HistoryRewrite.runIdentity(_))
+          .pipe(AgentHalt.runNever(_))
+          .pipe(ResponseHook.runMap(f)(_))
           .pipe(Tool.run(registry))
           .pipe(LLM.run(llm))
       )
@@ -765,6 +790,7 @@ class AgentSpec extends munit.FunSuite {
           .loop(ten, 6)
           .pipe(HistoryRewrite.runKeepLast(2)(_))
           .pipe(AgentHalt.runOn(Some("halted"))(_))
+          .pipe(ResponseHook.runIdentity(_))
           .pipe(Tool.run(TestTools))
           .pipe(LLM.run(llm))
       )
@@ -776,6 +802,109 @@ class AgentSpec extends munit.FunSuite {
         assertEquals(hist.size, 2)
         assertEquals(hist.map(_.content), List("m9", "m10"))
         assertEquals(llm.seen.size, 0, "halt 分支跳过 LLM")
+      case other => fail(s"expected Success, got $other")
+    }
+  }
+
+  // ====================== ResponseHook effect（L4 after_model hook）======================
+
+  test("ResponseHook.runIdentity: LLM response passes through unchanged") {
+    // 覆盖 Phase 3 的 identity path——通过 runLoopWithHistory 隐式验证（它 wire 了 runIdentity）
+    val llm = new RecordingLLM(List(LLMResponse.Answer("raw")))
+    val r = runLoopWithHistory(llm, TestTools, List(Message(Role.User, "q")))
+    r match {
+      case Result.Success((ans, _)) => assertEquals(ans, "raw")
+      case other                    => fail(s"expected Success, got $other")
+    }
+  }
+
+  test("ResponseHook.runMap: transform Answer text") {
+    // 把 Answer 的内容全部大写——verify f 作用到了 raw response
+    val llm = new RecordingLLM(List(LLMResponse.Answer("hello")))
+    val r = runLoopWithResponseMap(
+      llm,
+      TestTools,
+      List(Message(Role.User, "q")),
+      f = {
+        case LLMResponse.Answer(t) => LLMResponse.Answer(t.toUpperCase)
+        case other                 => other
+      }
+    )
+    assertEquals(r, Result.Success(("HELLO", List(
+      Message(Role.User, "q"),
+      Message(Role.Assistant, "HELLO")
+    ))))
+  }
+
+  test(
+    "ResponseHook.runMap: can convert Answer to ToolCalls (force tool use)"
+  ) {
+    // 展示 L4 after_model 的最大威力：改变控制流。
+    // LLM 说"done"，handler 把它改写成 tool call，agent 继续执行工具。
+    val llm = new RecordingLLM(
+      List(
+        LLMResponse.Answer("done"), // raw #1：LLM 想结束
+        LLMResponse.Answer("really done") // raw #2：tool 轮后再回 LLM 的回答
+      )
+    )
+    val forceAdd: LLMResponse => LLMResponse = {
+      // 第一次 Answer 改写成强制 tool call；之后的 Answer 保留
+      var firstAnswerSeen = false
+      r =>
+        r match {
+          case LLMResponse.Answer(_) if !firstAnswerSeen =>
+            firstAnswerSeen = true
+            LLMResponse.ToolCalls(
+              List(ToolInvocation("add", Map("a" -> "1", "b" -> "2")))
+            )
+          case other => other
+        }
+    }
+    val r = runLoopWithResponseMap(
+      llm,
+      TestTools,
+      List(Message(Role.User, "q")),
+      f = forceAdd
+    )
+    r match {
+      case Result.Success((ans, hist)) =>
+        // Answer 被改写成 tool call，所以第一轮做了工具调用；第二轮 LLM 才真正返回 "really done"
+        assertEquals(ans, "really done")
+        assertEquals(llm.seen.size, 2, "LLM 被调用两次——handler 改变了控制流")
+      case other => fail(s"expected Success, got $other")
+    }
+  }
+
+  test("ResponseHook.runMap: filter invalid tool names") {
+    // handler 过滤掉 LLM 幻觉出的不存在工具——只保留白名单
+    val allowList = Set("weather", "add")
+    val filterTools: LLMResponse => LLMResponse = {
+      case LLMResponse.ToolCalls(invs) =>
+        val valid = invs.filter(i => allowList.contains(i.name))
+        if (valid.isEmpty) LLMResponse.Answer("no valid tools requested")
+        else LLMResponse.ToolCalls(valid)
+      case other => other
+    }
+    val llm = new RecordingLLM(
+      List(
+        LLMResponse.ToolCalls(
+          List(
+            ToolInvocation("hallucinated", Map.empty),
+            ToolInvocation("also_fake", Map.empty)
+          )
+        )
+      )
+    )
+    val r = runLoopWithResponseMap(
+      llm,
+      TestTools,
+      List(Message(Role.User, "q")),
+      f = filterTools
+    )
+    r match {
+      case Result.Success((ans, _)) =>
+        assertEquals(ans, "no valid tools requested")
+        assertEquals(llm.seen.size, 1, "filter 后没 tool 调用，不需要回 LLM 第二轮")
       case other => fail(s"expected Success, got $other")
     }
   }
