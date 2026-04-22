@@ -31,13 +31,14 @@ Claude 的工作方式：
 
 ```
 core/src/main/scala/agent/
-├── AgentLoop.scala  — Role / Message / object Agent（loop + repl）
-├── Tool.scala       — ToolInvocation / Tool effect / ToolRegistry / object Tool / ToolMiddleware
-├── LLM.scala        — LLMResponse / LLMClient / LLM effect / object LLM / LLMMiddleware
-└── AgentApp.scala   — 可运行 demo（HeuristicLLM + DemoTools + REPL）
+├── AgentLoop.scala       — Role / Message / object Agent（loop + repl）
+├── Tool.scala            — ToolInvocation / Tool effect / ToolRegistry / object Tool / ToolMiddleware
+├── LLM.scala             — LLMResponse / LLMClient / LLM effect / object LLM / LLMMiddleware
+├── HistoryRewrite.scala  — L4 effect：before_model hook，runIdentity / runKeepLast
+└── AgentApp.scala        — 可运行 demo（HeuristicLLM + DemoTools + REPL）
 ```
 
-**对称结构**（Tool / LLM 两侧完全平行）：
+**L2/L3 对称结构**（Tool / LLM 两侧完全平行）：
 
 | 层 | Effect | Backend trait | Suspension | Handler | Middleware |
 |---|---|---|---|---|---|
@@ -45,6 +46,26 @@ core/src/main/scala/agent/
 | LLM | `sealed trait LLM extends ArrowEffect[Const[List[Message]], Const[LLMResponse]]` | `LLMClient` | `LLM.complete(history)` | `LLM.run(client)` | `LLMMiddleware = LLMClient => LLMClient` |
 
 **Backend trait 签名**：两侧 `call` / `complete` 都是 `... < (IO & Abort[Throwable])`——`IO` 是为 middleware 走 `kyo.Log` 留的通道。
+
+**L4 effects**（状态转移级 IoC，正交小 effect 方案，参见 `docs/kyo-middleware-ioc-layers.md`）：
+
+| Effect | suspend 时机 | 对应 LangChain hook | 已落地 handler |
+|---|---|---|---|
+| `HistoryRewrite` | 每次 `LLM.complete` 之前 | `before_model` / `modify_model_request` | `runIdentity` / `runKeepLast(n)` |
+| _未来_ `AgentHalt` | `decideNext` 入口 | `Command(goto='end')` | — |
+| _未来_ `ResponseHook` | `LLM.complete` 之后 | `after_model` | — |
+
+**L4 的 compaction 语义**（和 LangChain 共享）：`HistoryRewrite.apply(history)` 返回的 `rewritten` 成为当前 turn 的 history 基底——`decideNext` / `appendTurn` 都用 rewritten。若 handler 做了压缩，后续 session history 随之收敛，不是纯 view。
+
+**L4 wire**：和 L2/L3 同构，pipe 链叠加。每个 effect 必须显式 wire（Kyo 不提供 ambient 默认 handler），签名即能力清单：
+
+```scala
+Agent.loop(...)
+  .pipe(HistoryRewrite.runKeepLast(20)(_))   // L4 改写
+  .pipe(Tool.run(registry))                  // L3 discharge
+  .pipe(LLM.run(llmClient))                  // L3 discharge
+  ...
+```
 
 **Agent.loop 状态**：
 - 主版 `loop(initialHistory, maxSteps): (String, List[Message]) < (LLM & Tool & IO & Abort[Throwable])`——入参 history、返回(答案, 含 tool 轨迹与终答的完整 history)

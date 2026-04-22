@@ -60,6 +60,7 @@ class AgentSpec extends munit.FunSuite {
   ): Result[Throwable, String] =
     Agent
       .loop(input, maxSteps)
+      .pipe(HistoryRewrite.runIdentity(_))
       .pipe(Tool.run(registry))
       .pipe(LLM.run(llm))
       .pipe(runSilent(_))
@@ -347,6 +348,28 @@ class AgentSpec extends munit.FunSuite {
       runSilent(
         Agent
           .loop(initialHistory, maxSteps)
+          .pipe(HistoryRewrite.runIdentity(_))
+          .pipe(Tool.run(registry))
+          .pipe(LLM.run(llm))
+      )
+    Abort.run[Throwable](IO.Unsafe.run(handled)).eval
+  }
+
+  /** HistoryRewrite 测试专用：把 keepLast(n) 作为改写 handler 跑 loop。 和 runLoopWithHistory
+    * 差别只在 pipe 链里 HistoryRewrite 用的是 runKeepLast 而非 runIdentity。
+    */
+  private def runLoopWithKeepLast(
+      llm: LLMClient,
+      registry: ToolRegistry,
+      initialHistory: List[Message],
+      n: Int,
+      maxSteps: Int = 6
+  ): Result[Throwable, (String, List[Message])] = {
+    val handled: (String, List[Message]) < (IO & Abort[Throwable]) =
+      runSilent(
+        Agent
+          .loop(initialHistory, maxSteps)
+          .pipe(HistoryRewrite.runKeepLast(n)(_))
           .pipe(Tool.run(registry))
           .pipe(LLM.run(llm))
       )
@@ -561,5 +584,97 @@ class AgentSpec extends munit.FunSuite {
       s"wrong order should yield folded error on first fail, got $r2"
     )
     assertEquals(flaky2.attempts.get(), 1, "wrong order: retry never triggers")
+  }
+
+  // ====================== HistoryRewrite effect（L4 before_model hook）======================
+
+  test("HistoryRewrite.runIdentity: LLM sees full history unchanged") {
+    val llm = new RecordingLLM(List(LLMResponse.Answer("ok")))
+    val existing = List(
+      Message(Role.User, "q1"),
+      Message(Role.Assistant, "a1"),
+      Message(Role.User, "q2"),
+      Message(Role.Assistant, "a2"),
+      Message(Role.User, "q3")
+    )
+    val r = runLoopWithHistory(llm, TestTools, existing)
+    assert(r.isSuccess, s"expected success, got $r")
+    // identity handler 下 LLM 看到完整原始 history
+    assertEquals(llm.seen.head, existing)
+  }
+
+  test("HistoryRewrite.runKeepLast: LLM sees only tail n messages") {
+    val llm = new RecordingLLM(List(LLMResponse.Answer("ok")))
+    val ten = (1 to 10).map(i => Message(Role.User, s"msg $i")).toList
+    val r = runLoopWithKeepLast(llm, TestTools, ten, n = 3)
+    assert(r.isSuccess, s"expected success, got $r")
+    // LLM 只看到最后 3 条
+    assertEquals(llm.seen.head.size, 3)
+    assertEquals(
+      llm.seen.head,
+      List(
+        Message(Role.User, "msg 8"),
+        Message(Role.User, "msg 9"),
+        Message(Role.User, "msg 10")
+      )
+    )
+  }
+
+  test("HistoryRewrite.runKeepLast: n >= history.size acts as identity") {
+    val llm = new RecordingLLM(List(LLMResponse.Answer("ok")))
+    val three = List(
+      Message(Role.User, "a"),
+      Message(Role.User, "b"),
+      Message(Role.User, "c")
+    )
+    val r = runLoopWithKeepLast(llm, TestTools, three, n = 100)
+    assert(r.isSuccess, s"expected success, got $r")
+    assertEquals(llm.seen.head, three, "n > size 不影响 history")
+  }
+
+  test(
+    "HistoryRewrite.runKeepLast: compaction semantics—returned history uses rewritten base"
+  ) {
+    // 关键语义：HistoryRewrite 是 compaction 而不是"仅 view"。
+    // rewritten 成为 decideNext 的 history 基底，最终返回的 history 也基于它。
+    val llm = new RecordingLLM(List(LLMResponse.Answer("final")))
+    val ten = (1 to 10).map(i => Message(Role.User, s"msg $i")).toList
+    val r = runLoopWithKeepLast(llm, TestTools, ten, n = 2)
+    r match {
+      case Result.Success((ans, hist)) =>
+        assertEquals(ans, "final")
+        // 返回的 hist = rewritten(最后 2 条) + Assistant(final) = 3
+        assertEquals(hist.size, 3)
+        assertEquals(hist.head, Message(Role.User, "msg 9"))
+        assertEquals(hist(1), Message(Role.User, "msg 10"))
+        assertEquals(hist.last, Message(Role.Assistant, "final"))
+      case other => fail(s"expected Success, got $other")
+    }
+  }
+
+  test(
+    "HistoryRewrite applied every turn: tool call branch also uses rewritten"
+  ) {
+    // 两轮 LLM 调用都经过 rewrite——不只 first turn。
+    val llm = new RecordingLLM(
+      List(
+        LLMResponse.ToolCalls(
+          List(ToolInvocation("weather", Map("city" -> "Tokyo")))
+        ),
+        LLMResponse.Answer("done")
+      )
+    )
+    val five = (1 to 5).map(i => Message(Role.User, s"m$i")).toList
+    val r = runLoopWithKeepLast(llm, TestTools, five, n = 2)
+    assert(r.isSuccess, s"expected success, got $r")
+    // 第 1 次 LLM 调用：rewrite 后 2 条
+    assertEquals(llm.seen(0).size, 2)
+    assertEquals(llm.seen(0).map(_.content), List("m4", "m5"))
+    // 第 2 次 LLM 调用：append tool 轨迹 (Assistant CALL + Tool result) 后再 rewrite 取 last 2
+    // = 最后两条（Assistant CALL + Tool result）
+    assertEquals(llm.seen(1).size, 2)
+    assertEquals(llm.seen(1)(0).role, Role.Assistant)
+    assert(llm.seen(1)(0).content.startsWith("CALL weather"))
+    assertEquals(llm.seen(1)(1).role, Role.Tool)
   }
 }
