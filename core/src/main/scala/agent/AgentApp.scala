@@ -18,8 +18,8 @@ import scala.util.chaining.*
   * }}}
   *
   * 注：`.pipe(f)` 需要 `f` 是 plain function，当 `f` 带 `using Frame` 等上下文参数时 Scala
-  * 不会自动 eta-expand，要写成 `.pipe(f(_))` 显式桥接。Kyo 的 effect handler 几乎都有
-  * Frame context，都适用这一写法。
+  * 不会自动 eta-expand，要写成 `.pipe(f(_))` 显式桥接。Kyo 的 effect handler 几乎都有 Frame
+  * context，都适用这一写法。
   *
   * `Tool.impl` / `LLM.impl` 不在最外层 pipe，而是被 `Agent.repl` 内部 per-turn 应用——必要， 见
   * AgentLoop.scala 的 repl docstring。

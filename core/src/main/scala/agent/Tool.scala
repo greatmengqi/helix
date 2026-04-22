@@ -32,13 +32,15 @@ trait ToolRegistry {
 
 object Tool {
 
-  /** **invoke**：raise 一次 Tool 调用——把 `ToolInvocation` 作为 suspended 计算抛出，
-    * 等待上层 handler 给回 `String`。
+  /** **invoke**：raise 一次 Tool 调用——把 `ToolInvocation` 作为 suspended 计算抛出， 等待上层
+    * handler 给回 `String`。
     *
     * **三层角色**（source-level）：
     *   - **def**：`sealed trait Tool extends ArrowEffect[...]`——效应契约（type）
-    *   - **invoke**：`def invoke(name, args)`（本方法）——调用方，`ArrowEffect.suspend` 的封装
-    *   - **impl**：`def impl(registry)`——handler 实现（terminal handler，dispatch 到 Backend）
+    *   - **invoke**：`def invoke(name, args)`（本方法）——调用方，`ArrowEffect.suspend`
+    *     的封装
+    *   - **impl**：`def impl(registry)`——handler 实现（terminal handler，dispatch 到
+    *     Backend）
     */
   inline def invoke(name: String, args: Map[String, String])(using
       inline frame: Frame,
@@ -47,8 +49,8 @@ object Tool {
     ArrowEffect.suspend[Any](tag, ToolInvocation(name, args))
 
   /** **impl**：terminal handler，把 Tool effect discharge 为对 `ToolRegistry`
-    * backend 的真实调用。结果类型从 `A < (Tool & S)` 变成 `A < (S & IO & Abort[Throwable])`——
-    * Tool 消失，registry.call 引入 IO + Abort。
+    * backend 的真实调用。结果类型从 `A < (Tool & S)` 变成
+    * `A < (S & IO & Abort[Throwable])`—— Tool 消失，registry.call 引入 IO + Abort。
     */
   inline def impl[A, S](registry: ToolRegistry)(v: A < (Tool & S))(using
       inline frame: Frame,
@@ -75,8 +77,8 @@ object Tool {
   *
   * 叠加顺序：`(a compose b compose c)(reg)` 等价于 `a(b(c(reg)))`——compose 左侧最外层，
   * 最先看到请求、最后加工响应。像 HTTP middleware stack。不抽专门的 `chain` 函数——stdlib
-  * `Function1.compose` + `scala.util.chaining.pipe` 已经覆盖所有语义，多一层命名聚合是 API
-  * sugar 而非代数抽象（详见决策 #13）。
+  * `Function1.compose` + `scala.util.chaining.pipe` 已经覆盖所有语义，多一层命名聚合是 API sugar
+  * 而非代数抽象（详见决策 #13）。
   *
   * 日志走 `kyo.Log`：middleware 不再持有 `Logger` 实例，从环境取（`Log.let` /
   * `Log.withConsoleLogger` 在外层注入）。 测试要静默就在 wire 时用 `Log.let(silentLog)`。

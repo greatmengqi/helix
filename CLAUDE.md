@@ -83,16 +83,20 @@ Agent.loop(...)
   ...
 ```
 
-**`ResponseHook` 限制**：handler 拿不到 history 上下文，能做 `LLMResponse => LLMResponse` transform（识别空答案、过滤非法工具、强制转 ToolCalls），**不能**回放 LLM——重放 LLM 属 L5 级，需要状态机结构化抽象。
+**`ResponseHook` 限制**：handler 拿不到 history 上下文，能做 `LLMResponse => LLMResponse` transform（识别空答案、过滤非法工具、强制转 ToolCalls），**不能**回放 LLM——重放 LLM 属 L5 级（见 `loopWithReplay`）。
+
+**L5 meta-loop（`Agent.loopWithReplay`）**：在 `loop` 外层套一圈 `Loop`，`judge(ans, history)` 决定是否重入下一轮 `loop`——承载"LLM 说 Done 但我想继续"、reflexion 自检、置信度阈值再思考等场景。不是新 effect，是把 `loop` 当 `(history) => (ans, history)` 变换反复迭代，**内层所有 L2/L3/L4 wire 原封照用**（签名即证）。判决 `judge: (String, List[Message]) => Option[Message]` 是纯 Scala——`None` 终止、`Some(hint)` 把 hint append 后重入下轮。`maxRounds` budget 耗尽走 **best-effort** 正常返回（不 Abort），区别于内层 `maxSteps` 的硬 Abort：meta-loop 是"不如不试"，内层是"跑失控了"。`maxRounds < 1` 显式 `Abort.fail(IllegalArgumentException)`，不 silent 退化。
 
 **Agent.loop 状态**：
 - 主版 `loop(initialHistory, maxSteps): (String, List[Message]) < (LLM & Tool & IO & Abort[Throwable])`——入参 history、返回(答案, 含 tool 轨迹与终答的完整 history)
 - 单发 overload `loop(userInput, maxSteps = DefaultMaxSteps): String < ...`——便捷入口
+- L5 `loopWithReplay(initialHistory, maxRounds, judge, innerMaxSteps)` + single-input `loopWithReplay(userInput, maxRounds, judge, innerMaxSteps = DefaultMaxSteps)`——两个 overload 和 `loop` 对称（history 版不带 default，便捷版带 default，规避决策 #3 的 accessor 冲突）
 - 用 `Loop[List[Message], Int, (String, List[Message]), _]` 把 history 和剩余步数作为循环状态显式 threading
 
 **Agent.repl 跨 turn 累计**：
 - `Loop[List[Message], Unit, Unit, _]` 把 session 级 history 作为循环状态
 - per-turn 异常隔离：`Abort.recover[Throwable]` 把 agent 失败折成错误字符串 + **回滚 history**（丢弃失败轮 user 输入，防止污染后续 LLM 上下文），REPL 继续存活
+- **不做 `replWithReplay` 对称扩展**：REPL 里每轮 user 输入本身就是外部 judge（人在 loop），自动 replay 和人工交互会语义重叠——auto-hint 和 user-prompt 同通道注入会让 LLM 分不清"人类追问"和"框架自检"。若将来需要 REPL 内 replay，应作为 per-turn 内嵌（把 `loop(nextHistory, ...)` 替换成 `loopWithReplay(nextHistory, ..., judge)`），不暴露独立 `replWithReplay` 入口
 
 **Middleware**（已落地）：
 - `ToolMiddleware.errorHandling`：把 Abort 折叠成 `<tool_error ...>` 字符串喂给 LLM，同时 `Log.error` 留痕
@@ -126,3 +130,9 @@ Agent.loop(...)
 12. **Local vs ArrowEffect 的语义边界**：贯穿计算的"上下文配置"（logger、tracer、当前 user_id）适合 `Local[T]`——快速读，无 continuation 开销。每次都要被拦截/接管的"协议调用"（LLM、Tool、HTTP）适合 `ArrowEffect`。Kyo 的 Env / Local / ArrowEffect 三档代价递增，按粒度选
 13. **不抽 `chain` 函数组合 middleware**：`ToolMiddleware` / `LLMMiddleware` 本质是 `A => A`，stdlib `Function1.compose` 已经是 endomorphism monoid 的组合子，`scala.util.chaining.pipe` 给出应用语义。自建 `chain(mws*)` 只是 API 聚合（variadic sugar + 命名空间），**不引入新代数能力**。按"抽象必须区分什么 / 必须买到新能力"的原则删除。未来如果出现需要"middleware 栈作为一等值参与更大代数运算"（比如 `Monoid[Endo]` 参与环境配置合并），再引入也来得及——那时候是代数抽象，不是 API 聚合
 14. **`.pipe(f)` + Kyo handler 的 eta-expansion 坑**：Scala 3 不会自动把带 `using Frame` / context function 的方法 eta-expand 成 `A => B`。`Kyo` 的 effect handler（`IO.Unsafe.run` / `Abort.run[E]` / `Log.withConsoleLogger` / 自定义 `Tool.impl(registry)` / `LLM.impl(client)` 等）**几乎都有 Frame context**，所以 `.pipe(Log.withConsoleLogger)` 会编译报 `Found: Frame ?=> ... =>, Required: A =>` 之类的型错。**一律写 `.pipe(handler(_))`**——underscore 强制 eta-expand 成普通函数，Frame 从外层 scope 注入。这不是 pipe 的缺陷，是 Scala 3 context-function 类型和普通函数类型不互为 subtype 的直接后果
+15. **L5 `loopWithReplay` 设计选择**：
+    - **不造新 effect**：replay 是"反复调用 `loop`"的控制结构，不是横切效应。ArrowEffect 适合"每次都要被拦截/接管的协议调用"，外层控制流用普通 `Loop` + 函数参数即可，不值得多一个 effect trait 占用签名通道
+    - **judge 纯 Scala 不取 effect**：MVP 判决函数只能读 `(ans, history)` 做纯决策。若未来需要 judge 调 LLM（"让另一个模型评分"）/ Tool（"查置信度 tool"），再加一个 overload 把 signature 升级为 `judge: ... => Option[Message] < (LLM & ...)`。现在加会过度设计
+    - **budget best-effort vs 硬 Abort**：maxRounds 耗尽按 best-effort 返回，和内层 maxSteps 硬 Abort 区分——replay 是"锦上添花"的额外轮次，跑不够不该让调用方走异常路径；内层 maxSteps 耗尽代表 agent 逻辑失控，必须异常
+    - **`maxRounds` 不设默认值**：replay 是显式意图，静默启用 3 轮重试会让调用方意外被收多倍 token 费。`innerMaxSteps` 有默认（和 `loop` 对称），`maxRounds` 要求显式传
+    - **不提供 `replWithReplay` 对称入口**：REPL 场景里人类输入就是外部 judge，自动 replay 和人工交互会语义重叠。需要时在 repl 内部把 `loop(...)` 换成 `loopWithReplay(...)`，不暴露独立入口

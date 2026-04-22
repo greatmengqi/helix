@@ -64,8 +64,8 @@ object Agent {
             rewritten <- HistoryRewrite.invoke(history)
             // L4 goto='end' hook：handler 返回 Some(reason) 则跳过 LLM 直接终止。
             // runNever 下永远 None，行为等价于不启用 halt；runOn(guard) 可按外部 state 决策。
-            haltOpt   <- AgentHalt.invoke()
-            outcome   <- haltOpt match {
+            haltOpt <- AgentHalt.invoke()
+            outcome <- haltOpt match {
               case Some(reason) =>
                 // 早停：不调 LLM，用 rewritten 作为终态 history（compaction 一致性），
                 // reason 作为答案——LangChain Command(goto='end', update={answer: reason}) 的对位
@@ -76,13 +76,13 @@ object Agent {
                 )
               case None =>
                 for {
-                  raw      <- LLM.invoke(rewritten)
+                  raw <- LLM.invoke(rewritten)
                   // L4 after_model hook：handler 可改写 LLM 返回值
                   // （空答案回落默认 / 过滤非法工具 / 强制工具调用）。
                   response <- ResponseHook.invoke(raw)
                   // decideNext 用 rewritten 作为基底 append——若 handler 做了压缩，
                   // 后续 session history 也相应收敛（compaction 语义，而非纯 view）。
-                  decided  <- decideNext(response, rewritten, remaining)
+                  decided <- decideNext(response, rewritten, remaining)
                 } yield decided
             }
           } yield outcome
@@ -103,6 +103,131 @@ object Agent {
     (LLM & Tool & HistoryRewrite & AgentHalt & ResponseHook & IO &
       Abort[Throwable]) =
     loop(List(Message(Role.User, userInput)), maxSteps).map(_._1)
+
+  /** L5 meta-loop：在 [[loop]] 外层再套一圈，`judge` 决定本轮答案"够不够好"， 不够就把 `judge` 返回的消息注入
+    * history，重入下一轮 [[loop]]。
+    *
+    * **这不是新 effect，是把 [[loop]] 当 pure-ish 的 `(history) => (ans, history)`
+    * 变换反复迭代**—— 用 Kyo `Loop` 承载外层状态，内层 [[loop]] 的所有 L2/L3/L4 wire 原封照用（签名即证）。
+    *
+    * 对应能力：
+    *   - "LLM 说 Done 但我想继续"（judge 基于 ans 文本判不够好，注入 System/User 补充消息）
+    *   - reflexion 式自检（judge 让 agent 回顾上一轮，注入 critique）
+    *   - 置信度阈值驱动的再思考（judge 读 history 最后 Assistant 置信度，注入"再核实一次"）
+    *
+    * 参数：
+    *   - `maxRounds` ≥ 1：[[loop]] 最大调用次数（含首次）。1 等价于直接调 [[loop]]，不产生 replay
+    *   - `judge(ans, history)`：返回 `None` 终止并返回 `(ans, history)`； 返回
+    *     `Some(hint)` 把 hint 追加到 history 末尾，remaining-1 后重入 [[loop]]
+    *
+    * 硬上限语义：`remaining == 1` 时即使 `judge` 返回 `Some`，也直接返回当前 `(ans, history)`
+    * ——budget 耗尽按"best-effort"语义走正常路径，不 Abort。和 [[loop]] 内部 maxSteps 的硬 Abort
+    * 语义不同：meta-loop 的 maxRounds 是"不如不试"，内层 maxSteps 是"跑失控了"。
+    *
+    * 边界约定（`maxRounds < 1`）：`Abort.fail(IllegalArgumentException)`——显式拒绝无意义输入， 不
+    * silent 退化为 1 轮。调用方要动态决定是否 replay 时自己判断。
+    *
+    * 判决函数纯 Scala，不取 effect——如果 judge 需要调 LLM / Tool，再加一个 overload 把 signature
+    * 升级为 `judge: ... => Option[Message] < (LLM & ...)`。当前 MVP 不做，等消费场景出现。
+    *
+    * 没给 `innerMaxSteps` 默认值——和 [[loop]] 两个 overload 一样的处理：默认值统一放在 single-input
+    * 便捷 overload 里（决策 #3 Scala 3 overload + default 限制）。调用方传 `DefaultMaxSteps`
+    * 是最常见路径。`maxRounds` 不给默认——replay 不应该被静默启用，必须显式表达"我要重试 N 次"。
+    */
+  def loopWithReplay(
+      initialHistory: List[Message],
+      maxRounds: Int,
+      judge: (String, List[Message]) => Option[Message],
+      innerMaxSteps: Int
+  ): (String, List[Message]) <
+    (LLM & Tool & HistoryRewrite & AgentHalt & ResponseHook & IO &
+      Abort[Throwable]) =
+    if (maxRounds < 1)
+      Abort.fail(
+        new IllegalArgumentException(
+          s"loopWithReplay: maxRounds must be >= 1, got $maxRounds"
+        )
+      )
+    else
+      for {
+        _ <- Log.info(
+          s"replay.start history_size=${initialHistory.size} max_rounds=$maxRounds inner_max_steps=$innerMaxSteps"
+        )
+        result <- Loop[
+          List[Message],
+          Int,
+          (String, List[Message]),
+          LLM & Tool & HistoryRewrite & AgentHalt & ResponseHook & IO &
+            Abort[Throwable]
+        ](initialHistory, maxRounds) { (history, remaining) =>
+          for {
+            pair <- loop(history, innerMaxSteps)
+            (ans, updated) = pair
+            next <- judge(ans, updated) match {
+              case None =>
+                Log
+                  .info(s"replay.stop reason=judge-none remaining=$remaining")
+                  .map(_ =>
+                    Loop
+                      .done[List[Message], Int, (String, List[Message])](
+                        (ans, updated)
+                      )
+                  )
+              case Some(_) if remaining <= 1 =>
+                // budget 耗尽但 judge 还想继续：正常返回当前结果，不 Abort
+                Log
+                  .info(
+                    s"replay.stop reason=budget-exhausted remaining=$remaining"
+                  )
+                  .map(_ =>
+                    Loop
+                      .done[List[Message], Int, (String, List[Message])](
+                        (ans, updated)
+                      )
+                  )
+              case Some(hint) =>
+                Log
+                  .info(
+                    s"replay.continue remaining=${remaining - 1} hint_role=${hint.role}"
+                  )
+                  .map(_ =>
+                    Loop
+                      .continue[List[Message], Int, (String, List[Message])](
+                        updated :+ hint,
+                        remaining - 1
+                      )
+                  )
+            }
+          } yield next
+        }
+        _ <- Log.info(
+          s"replay.end history_size=${result._2.size} answer=${
+              val a = result._1; if (a.length > 40) a.take(40) + "…" else a
+            }"
+        )
+      } yield result
+
+  /** [[loopWithReplay]] 单发 overload：一次性提问场景，只关心终答不关心 history。 完全等价于用
+    * `List(Message(Role.User, userInput))` 起一个 history 跑 stateful 版再
+    * `.map(_._1)`。
+    *
+    * `innerMaxSteps = DefaultMaxSteps` 的默认值只在这个 overload 上——history 版本要求显式传， 避开
+    * Scala 3 overload + default accessor 命名冲突（决策 #3）。
+    */
+  def loopWithReplay(
+      userInput: String,
+      maxRounds: Int,
+      judge: (String, List[Message]) => Option[Message],
+      innerMaxSteps: Int = DefaultMaxSteps
+  ): String <
+    (LLM & Tool & HistoryRewrite & AgentHalt & ResponseHook & IO &
+      Abort[Throwable]) =
+    loopWithReplay(
+      List(Message(Role.User, userInput)),
+      maxRounds,
+      judge,
+      innerMaxSteps
+    ).map(_._1)
 
   /** 无限主循环（REPL）：读一行 → 带累计 history 跑一次 agent → 打印 → 继续读下一行。
     *
@@ -194,8 +319,8 @@ object Agent {
   /** 决定当前 LLM 响应后 agent 的下一步：终结 or 继续。
     *
     * Answer 分支：把 Assistant 终答 append 入 history 后 `Loop.done`。 ToolCalls
-    * 分支：串行执行每个 invocation（保留原序），结果拼回 history 后 `Loop.continue`。
-    * `remaining - 1` 是按"一次 LLM 推理步"扣，和工具数量无关。
+    * 分支：串行执行每个 invocation（保留原序），结果拼回 history 后 `Loop.continue`。 `remaining - 1`
+    * 是按"一次 LLM 推理步"扣，和工具数量无关。
     *
     * 未来补 `AgentHalt` effect 时，suspend 点放在本方法入口——halt 命中则忽略 response 直接
     * `Loop.done`。
