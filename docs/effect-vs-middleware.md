@@ -88,16 +88,41 @@ Agent.loop(...)
 
 **数据流细节**：
 
-```
-业务代码  Tool.invoke(name, args)                -- invoke 层（suspend）
-            ↓ CPS suspension
-effect 机制  ArrowEffect.suspend → handle([C] => ...)  -- Kyo runtime
-            ↓ 到达 impl body
-Tool.impl  registry.call(name, args)            -- ⭐ 这一步
-            ↓ 但 registry 实际是 wrapped
-middleware  errorHandling ─→ logging ─→ retry ─→ realRegistry.call  -- 层层装饰
-            ↓
-最底层    realRegistry.call(name, args)         -- 真实工具执行
+```mermaid
+flowchart TB
+    Code["<b>业务代码</b><br/>Agent.loop body"]
+
+    subgraph ImplBody ["Tool.impl handler body 〈L3 Effect〉"]
+        direction TB
+        CPS["⚙️ <b>CPS 机制</b><br/>ArrowEffect.handle<br/>suspend / cont"]
+        Disp["⭐ <b>registry.call(name, args)</b><br/>唯一的外部 dispatch 语句"]
+        CPS -.->|cont| Disp
+    end
+
+    subgraph MWChain ["ToolMiddleware 装饰链 〈L2〉"]
+        direction TB
+        EH["errorHandling<br/>折 Abort"]
+        LG["logging<br/>记 start/ok/fail"]
+        RT["retry<br/>失败重试"]
+        EH --> LG
+        LG --> RT
+    end
+
+    Real[("realRegistry<br/>真实后端")]
+
+    Code ==>|Tool.invoke| CPS
+    Disp ==>|registry = wrapped| EH
+    RT ==> Real
+
+    classDef code fill:#C8B8C5,stroke:#8E7B8A,color:#2F2F2F;
+    classDef impl fill:#A8B89C,stroke:#6F8065,color:#2F2F2F;
+    classDef mw fill:#C4B9A4,stroke:#8E8268,color:#2F2F2F;
+    classDef real fill:#A8B5C8,stroke:#6B7F98,color:#2F2F2F;
+
+    class Code code;
+    class CPS,Disp impl;
+    class EH,LG,RT mw;
+    class Real real;
 ```
 
 关键认知：`Tool.impl` 的 handler body 里那一行 `registry.call(input.name, input.args)`，本身形式不变，但**被喂的 registry 是谁**由 wire 时决定。middleware 层做的就是"在 `Tool.impl` 调 `registry.call` 之前/之后插自己的逻辑"。
@@ -128,6 +153,34 @@ ArrowEffect.handle(tag, v)([C] => (h, cont) =>
 
 impl 本身**就是完整策略**，handler body 里没有"调用某个 backend 接口"的步骤——也就没有可装饰的点。想"装饰"？直接写一个**新 impl**（`implLoggedKeepLast` 在 cont 之前插日志再调 cont），不抽 middleware 层。
 
+```mermaid
+flowchart LR
+    subgraph L3 ["L3 impl handler body 〈Tool / LLM〉"]
+        direction TB
+        A1["⚙️ CPS"]
+        A2["⭐ 可装饰的 dispatch 语句<br/>registry.call / client.complete"]
+        A1 -.->|cont| A2
+    end
+
+    subgraph L4 ["L4 impl handler body 〈HistoryRewrite / AgentHalt / ResponseHook〉"]
+        direction TB
+        B1["⚙️ CPS"]
+        B2["❌ 闭合策略<br/>cont(h.takeRight(n))"]
+        B1 -.->|cont| B2
+    end
+
+    L3 ==> L3Out["✓ 抽 middleware<br/>ToolMiddleware<br/>LLMMiddleware"]
+    L4 ==> L4Out["✗ 无 middleware<br/>加装饰 = 写新 impl"]
+
+    classDef body fill:#E8E0D5,stroke:#9E927D,color:#2F2F2F;
+    classDef good fill:#A8B89C,stroke:#6F8065,color:#2F2F2F;
+    classDef bad fill:#C8A8A8,stroke:#8E6F6F,color:#2F2F2F;
+
+    class A1,A2,B1,B2 body;
+    class L3Out good;
+    class L4Out bad;
+```
+
 具体"新 impl"的样子：
 
 ```scala
@@ -147,30 +200,41 @@ def implLoggedKeepLast[A, S](n: Int)(v: A < (HistoryRewrite & S))
 
 ## 决策树：新能力该用哪个？
 
-```
-我要加新能力 X
-│
-├─ X 是一个"新 suspend 点"（业务代码要 X.invoke(...)）？
-│   │
-│   ├─ 是 → 这是 effect（会改签名）
-│   │       ├─ 反转单次调用的 continuation？    → L3 effect（Tool / LLM 这类）
-│   │       └─ 反转跨调用的状态决策？           → L4 effect（HistoryRewrite / AgentHalt / ResponseHook）
-│   │
-│   └─ 否 → 看下一条
-│
-├─ X 是现有 backend 的"横切关注"（log / retry / cache / limit / fallback）？
-│   │
-│   ├─ 是 → 这是 middleware（不改签名）
-│   │       - 加到 ToolMiddleware / LLMMiddleware object 里
-│   │       - 对应 L2
-│   │
-│   └─ 否 → X 也许是更高层的东西（L5 动态图 / L6 会话策略）
-│            参考 kyo-middleware-ioc-layers.md 第一节
+```mermaid
+flowchart TD
+    Start(["我要加新能力 X"])
+    Q1{"X 是一个新 suspend 点？<br/>业务代码要调 X.invoke"}
+    Q2{"X 是对现有 backend 的横切关注？<br/>log / retry / cache / limit / fallback"}
+    Q3{"单次调用反转<br/>还是跨调用状态反转？"}
+    L3Eff["<b>加 L3 effect</b><br/>有 Backend trait<br/>Tool / LLM 形态"]
+    L4Eff["<b>加 L4 effect</b><br/>闭合策略 handler<br/>HistoryRewrite / AgentHalt 形态"]
+    MW["<b>加 middleware</b><br/>不改签名<br/>compose 进现有 backend"]
+    Upper["可能是 <b>L5 / L6</b><br/>动态图 / 会话策略<br/>参 kyo-middleware-ioc-layers.md"]
+
+    Start --> Q1
+    Q1 -->|是| Q3
+    Q1 -->|否| Q2
+    Q3 -->|单次调用| L3Eff
+    Q3 -->|跨调用状态| L4Eff
+    Q2 -->|是| MW
+    Q2 -->|否| Upper
+
+    classDef s fill:#C8B8C5,stroke:#8E7B8A,color:#2F2F2F;
+    classDef q fill:#E8E0D5,stroke:#9E927D,color:#2F2F2F;
+    classDef eff fill:#A8B89C,stroke:#6F8065,color:#2F2F2F;
+    classDef mw fill:#C4B9A4,stroke:#8E8268,color:#2F2F2F;
+    classDef other fill:#B8A8A8,stroke:#8E6F6F,color:#2F2F2F;
+
+    class Start s;
+    class Q1,Q2,Q3 q;
+    class L3Eff,L4Eff eff;
+    class MW mw;
+    class Upper other;
 ```
 
 **一句话判断**：改完你要不要动 `< (...)` 效应签名？
 
-- **要动** → effect
+- **要动** → effect（再看是 L3 还是 L4）
 - **不用动** → middleware
 
 ---
