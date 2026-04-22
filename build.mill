@@ -1,0 +1,26 @@
+import mill._
+import mill.scalalib._
+import mill.scalalib.scalafmt.ScalafmtModule
+
+trait Common extends ScalaModule with ScalafmtModule {
+  def scalaVersion = "3.8.3"
+}
+
+object core extends Common {
+  val kyoVersion = "0.19.0"
+
+  override def mvnDeps = Seq(
+    mvn"io.getkyo::kyo-core:$kyoVersion",
+    mvn"io.getkyo::kyo-direct:$kyoVersion",
+    // SLF4J backend：kyo.Log 默认尝试走 SLF4J，没 provider 就 fallback 到自建 console
+    // 加 slf4j-simple 消除启动警告，同时把日志流统一到 SLF4J 管道（方便未来换 logback / log4j2）
+    mvn"org.slf4j:slf4j-simple:2.0.13"
+  )
+
+  object test extends Common with TestModule.Munit {
+    override def moduleDeps = Seq(core)
+    override def mvnDeps = Seq(
+      mvn"org.scalameta::munit::1.0.3"
+    )
+  }
+}
