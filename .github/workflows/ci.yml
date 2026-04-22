@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: coursier/cache-action@v6
+
+      - uses: coursier/setup-action@v1
+        with:
+          jvm: temurin:21
+          apps: mill:1.1.5
+
+      - name: Compile
+        run: mill core.compile
+
+      - name: Test
+        run: mill core.test
