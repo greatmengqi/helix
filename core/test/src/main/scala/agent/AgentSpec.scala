@@ -61,6 +61,7 @@ class AgentSpec extends munit.FunSuite {
     Agent
       .loop(input, maxSteps)
       .pipe(HistoryRewrite.runIdentity(_))
+      .pipe(AgentHalt.runNever(_))
       .pipe(Tool.run(registry))
       .pipe(LLM.run(llm))
       .pipe(runSilent(_))
@@ -349,15 +350,14 @@ class AgentSpec extends munit.FunSuite {
         Agent
           .loop(initialHistory, maxSteps)
           .pipe(HistoryRewrite.runIdentity(_))
+          .pipe(AgentHalt.runNever(_))
           .pipe(Tool.run(registry))
           .pipe(LLM.run(llm))
       )
     Abort.run[Throwable](IO.Unsafe.run(handled)).eval
   }
 
-  /** HistoryRewrite 测试专用：把 keepLast(n) 作为改写 handler 跑 loop。 和 runLoopWithHistory
-    * 差别只在 pipe 链里 HistoryRewrite 用的是 runKeepLast 而非 runIdentity。
-    */
+  /** HistoryRewrite 测试专用：把 keepLast(n) 作为改写 handler 跑 loop。 */
   private def runLoopWithKeepLast(
       llm: LLMClient,
       registry: ToolRegistry,
@@ -370,6 +370,27 @@ class AgentSpec extends munit.FunSuite {
         Agent
           .loop(initialHistory, maxSteps)
           .pipe(HistoryRewrite.runKeepLast(n)(_))
+          .pipe(AgentHalt.runNever(_))
+          .pipe(Tool.run(registry))
+          .pipe(LLM.run(llm))
+      )
+    Abort.run[Throwable](IO.Unsafe.run(handled)).eval
+  }
+
+  /** AgentHalt 测试专用：把 guard 作为 halt handler 跑 loop。 */
+  private def runLoopWithHalt(
+      llm: LLMClient,
+      registry: ToolRegistry,
+      initialHistory: List[Message],
+      guard: => Option[String],
+      maxSteps: Int = 6
+  ): Result[Throwable, (String, List[Message])] = {
+    val handled: (String, List[Message]) < (IO & Abort[Throwable]) =
+      runSilent(
+        Agent
+          .loop(initialHistory, maxSteps)
+          .pipe(HistoryRewrite.runIdentity(_))
+          .pipe(AgentHalt.runOn(guard)(_))
           .pipe(Tool.run(registry))
           .pipe(LLM.run(llm))
       )
@@ -648,6 +669,113 @@ class AgentSpec extends munit.FunSuite {
         assertEquals(hist.head, Message(Role.User, "msg 9"))
         assertEquals(hist(1), Message(Role.User, "msg 10"))
         assertEquals(hist.last, Message(Role.Assistant, "final"))
+      case other => fail(s"expected Success, got $other")
+    }
+  }
+
+  // ====================== AgentHalt effect（L4 goto='end' hook）======================
+
+  test("AgentHalt.runNever: never halts, identity to existing behavior") {
+    val llm = new RecordingLLM(List(LLMResponse.Answer("normal ans")))
+    val input = List(Message(Role.User, "q"))
+    val r = runLoopWithHistory(llm, TestTools, input)
+    r match {
+      case Result.Success((ans, hist)) =>
+        assertEquals(ans, "normal ans")
+        assertEquals(llm.seen.size, 1, "LLM 应被正常调用")
+      case other => fail(s"expected Success, got $other")
+    }
+  }
+
+  test("AgentHalt.runOn: Some(reason) fires first turn → skips LLM entirely") {
+    val llm = new RecordingLLM(List.empty)
+    val input = List(Message(Role.User, "q"))
+    val r = runLoopWithHalt(
+      llm,
+      TestTools,
+      input,
+      guard = Some("halted by budget")
+    )
+    r match {
+      case Result.Success((ans, hist)) =>
+        assertEquals(ans, "halted by budget")
+        assertEquals(hist, input, "halt 分支返回 rewritten 作为终态 history")
+        assertEquals(llm.seen.size, 0, "LLM 不应被调用")
+      case other => fail(s"expected Success, got $other")
+    }
+  }
+
+  test("AgentHalt.runOn: guard re-evaluates each check, fires after N turns") {
+    // guard 捕获外部计数，第 3 次 check 时返回 Some
+    val checks = new java.util.concurrent.atomic.AtomicInteger(0)
+    def guard: Option[String] = {
+      val n = checks.incrementAndGet()
+      if (n >= 3) Some(s"halt at check $n") else None
+    }
+    val llm = new RecordingLLM(
+      List(
+        LLMResponse.ToolCalls(
+          List(ToolInvocation("add", Map("a" -> "1", "b" -> "1")))
+        ),
+        LLMResponse.ToolCalls(
+          List(ToolInvocation("add", Map("a" -> "2", "b" -> "2")))
+        ),
+        LLMResponse.Answer("never reached")
+      )
+    )
+    val input = List(Message(Role.User, "q"))
+    val r = runLoopWithHalt(llm, TestTools, input, guard = guard)
+    r match {
+      case Result.Success((ans, hist)) =>
+        // check 1: None → LLM 1，tool call
+        // check 2: None → LLM 2，tool call
+        // check 3: Some("halt at check 3") → 跳过 LLM，终止
+        assertEquals(ans, "halt at check 3")
+        assertEquals(llm.seen.size, 2, "只有前两轮 LLM 被调用")
+        assertEquals(checks.get(), 3, "guard 被求值 3 次")
+      case other => fail(s"expected Success, got $other")
+    }
+  }
+
+  test(
+    "AgentHalt vs maxSteps: halt is soft termination, maxSteps is hard Abort"
+  ) {
+    // halt 永远返回 Some → 首轮就终止，即便 maxSteps 很大也不 Abort
+    val llm = new RecordingLLM(List.empty)
+    val r = runLoopWithHalt(
+      llm,
+      TestTools,
+      List(Message(Role.User, "q")),
+      guard = Some("done"),
+      maxSteps = 100
+    )
+    assert(r.isSuccess, "halt 是正常终止，不应该 Abort")
+    assertEquals(r, Result.Success(("done", List(Message(Role.User, "q")))))
+  }
+
+  test(
+    "AgentHalt + HistoryRewrite: both fire, halt branch uses rewritten history"
+  ) {
+    // 同时 wire keepLast(2) + runOn(Some("halted"))——验证 halt 分支返回 hist 是 rewritten
+    val llm = new RecordingLLM(List.empty)
+    val ten = (1 to 10).map(i => Message(Role.User, s"m$i")).toList
+    val handled: (String, List[Message]) < (IO & Abort[Throwable]) =
+      runSilent(
+        Agent
+          .loop(ten, 6)
+          .pipe(HistoryRewrite.runKeepLast(2)(_))
+          .pipe(AgentHalt.runOn(Some("halted"))(_))
+          .pipe(Tool.run(TestTools))
+          .pipe(LLM.run(llm))
+      )
+    val r = Abort.run[Throwable](IO.Unsafe.run(handled)).eval
+    r match {
+      case Result.Success((ans, hist)) =>
+        assertEquals(ans, "halted")
+        // 关键：halt 分支返回的 hist 是 rewritten（keepLast(2) → 2 条），不是原始 10 条
+        assertEquals(hist.size, 2)
+        assertEquals(hist.map(_.content), List("m9", "m10"))
+        assertEquals(llm.seen.size, 0, "halt 分支跳过 LLM")
       case other => fail(s"expected Success, got $other")
     }
   }

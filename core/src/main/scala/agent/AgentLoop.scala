@@ -39,7 +39,7 @@ object Agent {
       initialHistory: List[Message],
       maxSteps: Int
   ): (String, List[Message]) <
-    (LLM & Tool & HistoryRewrite & IO & Abort[Throwable]) =
+    (LLM & Tool & HistoryRewrite & AgentHalt & IO & Abort[Throwable]) =
     for {
       _ <- Log.info(
         s"loop.start history_size=${initialHistory.size} max_steps=$maxSteps"
@@ -49,7 +49,7 @@ object Agent {
         List[Message],
         Int,
         (String, List[Message]),
-        LLM & Tool & HistoryRewrite & IO & Abort[Throwable]
+        LLM & Tool & HistoryRewrite & AgentHalt & IO & Abort[Throwable]
       ](initialHistory, maxSteps) { (history, remaining) =>
         if (remaining <= 0)
           Abort.fail(
@@ -60,10 +60,26 @@ object Agent {
             // L4 before_model hook：handler 可改写 history（截断 / 压缩 / 注入 system）。
             // runIdentity 下 rewritten === history；runKeepLast(n) 下裁成尾部 n 条。
             rewritten <- HistoryRewrite.apply(history)
-            response  <- LLM.complete(rewritten)
-            // decideNext 用 rewritten 作为基底 append——若 handler 做了压缩，
-            // 后续 session history 也相应收敛（compaction 语义，而非纯 view）。
-            outcome   <- decideNext(response, rewritten, remaining)
+            // L4 goto='end' hook：handler 返回 Some(reason) 则跳过 LLM 直接终止。
+            // runNever 下永远 None，行为等价于不启用 halt；runOn(guard) 可按外部 state 决策。
+            haltOpt   <- AgentHalt.check()
+            outcome   <- haltOpt match {
+              case Some(reason) =>
+                // 早停：不调 LLM，用 rewritten 作为终态 history（compaction 一致性），
+                // reason 作为答案——LangChain Command(goto='end', update={answer: reason}) 的对位
+                IO(
+                  Loop.done[List[Message], Int, (String, List[Message])](
+                    (reason, rewritten)
+                  )
+                )
+              case None =>
+                for {
+                  response <- LLM.complete(rewritten)
+                  // decideNext 用 rewritten 作为基底 append——若 handler 做了压缩，
+                  // 后续 session history 也相应收敛（compaction 语义，而非纯 view）。
+                  decided  <- decideNext(response, rewritten, remaining)
+                } yield decided
+            }
           } yield outcome
       }
       elapsedMs <- IO((java.lang.System.nanoTime() - startedNanos) / 1_000_000)
@@ -78,7 +94,7 @@ object Agent {
   def loop(
       userInput: String,
       maxSteps: Int = DefaultMaxSteps
-  ): String < (LLM & Tool & HistoryRewrite & IO & Abort[Throwable]) =
+  ): String < (LLM & Tool & HistoryRewrite & AgentHalt & IO & Abort[Throwable]) =
     loop(List(Message(Role.User, userInput)), maxSteps).map(_._1)
 
   /** 无限主循环（REPL）：读一行 → 带累计 history 跑一次 agent → 打印 → 继续读下一行。
@@ -131,11 +147,12 @@ object Agent {
               for {
                 // Per-turn discharge：Tool.run / LLM.run 在 Abort.run 内层应用，让 Abort.run
                 // 的作用域能 catch 它们 handler 回调里 raise 的 Abort。三分支 match 决定下一步状态。
-                // repl 内部默认把 HistoryRewrite 装配为 identity（无改写）。
-                // 需要 custom 改写策略的调用方应该绕过 repl 自己写 runner，
-                // 或等 repl overload 把 HistoryRewrite handler 作为参数暴露出来。
+                // repl 内部默认把 L4 effects 都装配为 identity（HistoryRewrite.runIdentity /
+                // AgentHalt.runNever）。需要 custom 策略的调用方应该绕过 repl 自己写 runner，
+                // 或等 repl overload 把 handler 作为参数暴露出来。
                 resultR <- loop(nextHistory, DefaultMaxSteps)
                   .pipe(HistoryRewrite.runIdentity(_))
+                  .pipe(AgentHalt.runNever(_))
                   .pipe(Tool.run(registry))
                   .pipe(LLM.run(llm))
                   .pipe(Abort.run[Throwable](_))

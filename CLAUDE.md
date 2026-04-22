@@ -35,6 +35,7 @@ core/src/main/scala/agent/
 ├── Tool.scala            — ToolInvocation / Tool effect / ToolRegistry / object Tool / ToolMiddleware
 ├── LLM.scala             — LLMResponse / LLMClient / LLM effect / object LLM / LLMMiddleware
 ├── HistoryRewrite.scala  — L4 effect：before_model hook，runIdentity / runKeepLast
+├── AgentHalt.scala       — L4 effect：goto='end' hook，runNever / runOn
 └── AgentApp.scala        — 可运行 demo（HeuristicLLM + DemoTools + REPL）
 ```
 
@@ -52,8 +53,10 @@ core/src/main/scala/agent/
 | Effect | suspend 时机 | 对应 LangChain hook | 已落地 handler |
 |---|---|---|---|
 | `HistoryRewrite` | 每次 `LLM.complete` 之前 | `before_model` / `modify_model_request` | `runIdentity` / `runKeepLast(n)` |
-| _未来_ `AgentHalt` | `decideNext` 入口 | `Command(goto='end')` | — |
+| `AgentHalt` | `HistoryRewrite` 之后、`LLM.complete` 之前 | `Command(goto='end')` | `runNever` / `runOn(guard)` |
 | _未来_ `ResponseHook` | `LLM.complete` 之后 | `after_model` | — |
+
+**`AgentHalt` vs `maxSteps`**：`maxSteps` 是硬上限（超限 `Abort.fail`，调用方异常路径），`AgentHalt` 是软终止（`Loop.done` 返回 reason 作为 answer，正常路径）。两者正交共存。
 
 **L4 的 compaction 语义**（和 LangChain 共享）：`HistoryRewrite.apply(history)` 返回的 `rewritten` 成为当前 turn 的 history 基底——`decideNext` / `appendTurn` 都用 rewritten。若 handler 做了压缩，后续 session history 随之收敛，不是纯 view。
 
@@ -62,6 +65,7 @@ core/src/main/scala/agent/
 ```scala
 Agent.loop(...)
   .pipe(HistoryRewrite.runKeepLast(20)(_))   // L4 改写
+  .pipe(AgentHalt.runOn(budgetGuard)(_))     // L4 早停
   .pipe(Tool.run(registry))                  // L3 discharge
   .pipe(LLM.run(llmClient))                  // L3 discharge
   ...
