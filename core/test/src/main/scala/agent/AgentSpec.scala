@@ -934,4 +934,393 @@ class AgentSpec extends munit.FunSuite {
     assert(llm.seen(1)(0).content.startsWith("CALL weather"))
     assertEquals(llm.seen(1)(1).role, Role.Tool)
   }
+
+  // ====================== Agent.loopWithReplay（L5 meta-loop）======================
+
+  /** 通用 runner：把 loopWithReplay 的效应全部 discharge 到 Result。 所有 L4 走 identity，和 L3
+    * 一样要 wire（签名即能力清单）。
+    */
+  private def runReplay(
+      llm: LLMClient,
+      registry: ToolRegistry,
+      initialHistory: List[Message],
+      maxRounds: Int,
+      judge: (String, List[Message]) => Option[Message],
+      innerMaxSteps: Int = 6
+  ): Result[Throwable, (String, List[Message])] = {
+    val handled: (String, List[Message]) < (IO & Abort[Throwable]) =
+      runSilent(
+        Agent
+          .loopWithReplay(initialHistory, maxRounds, judge, innerMaxSteps)
+          .pipe(HistoryRewrite.implIdentity(_))
+          .pipe(AgentHalt.implNever(_))
+          .pipe(ResponseHook.implIdentity(_))
+          .pipe(Tool.impl(registry))
+          .pipe(LLM.impl(llm))
+      )
+    Abort.run[Throwable](IO.Unsafe.run(handled)).eval
+  }
+
+  test("loopWithReplay: judge=None on round 1 → single round, no replay") {
+    // judge 首轮判"够好"——只发生一次 Agent.loop 调用，等价于不 replay
+    val llm = new RecordingLLM(List(LLMResponse.Answer("good answer")))
+    val r = runReplay(
+      llm,
+      TestTools,
+      List(Message(Role.User, "q")),
+      maxRounds = 3,
+      judge = (_, _) => None
+    )
+    r match {
+      case Result.Success((ans, hist)) =>
+        assertEquals(ans, "good answer")
+        assertEquals(llm.seen.size, 1, "只调一次 LLM")
+        assertEquals(hist.last, Message(Role.Assistant, "good answer"))
+      case other => fail(s"expected Success, got $other")
+    }
+  }
+
+  test("loopWithReplay: judge injects hint → round 2 LLM sees hint in history") {
+    // judge 首轮判不够，注入 "elaborate"——LLM 第二次调用应该看到前一轮的 Assistant 终答 + hint
+    val llm = new RecordingLLM(
+      List(
+        LLMResponse.Answer("short"),
+        LLMResponse.Answer("detailed answer now")
+      )
+    )
+    val r = runReplay(
+      llm,
+      TestTools,
+      List(Message(Role.User, "q")),
+      maxRounds = 3,
+      judge = (ans, _) =>
+        if (ans == "short") Some(Message(Role.User, "elaborate"))
+        else None
+    )
+    r match {
+      case Result.Success((ans, hist)) =>
+        assertEquals(ans, "detailed answer now")
+        assertEquals(llm.seen.size, 2, "judge 注入后第二轮 LLM 被调")
+        // round 2 LLM 看到的 history：[User(q), Assistant(short), User(elaborate)]
+        assertEquals(
+          llm.seen(1),
+          List(
+            Message(Role.User, "q"),
+            Message(Role.Assistant, "short"),
+            Message(Role.User, "elaborate")
+          )
+        )
+      case other => fail(s"expected Success, got $other")
+    }
+  }
+
+  test("loopWithReplay: hint role preserved (System vs User)") {
+    // judge 可以注入 System 消息——验证 role 不被框架篡改
+    val llm = new RecordingLLM(
+      List(
+        LLMResponse.Answer("a"),
+        LLMResponse.Answer("b")
+      )
+    )
+    val r = runReplay(
+      llm,
+      TestTools,
+      List(Message(Role.User, "q")),
+      maxRounds = 2,
+      judge = (ans, _) =>
+        if (ans == "a") Some(Message(Role.System, "must cite source"))
+        else None
+    )
+    r match {
+      case Result.Success(_) =>
+        assertEquals(llm.seen(1).last, Message(Role.System, "must cite source"))
+      case other => fail(s"expected Success, got $other")
+    }
+  }
+
+  test(
+    "loopWithReplay: budget exhausted → best-effort return (not Abort)"
+  ) {
+    // judge 永远返回 Some，maxRounds=2 应跑 2 次 Agent.loop 后返回最后一次结果，不 Abort
+    val llm = new RecordingLLM(
+      List(
+        LLMResponse.Answer("round 1"),
+        LLMResponse.Answer("round 2")
+      )
+    )
+    val r = runReplay(
+      llm,
+      TestTools,
+      List(Message(Role.User, "q")),
+      maxRounds = 2,
+      judge = (_, _) => Some(Message(Role.User, "more"))
+    )
+    r match {
+      case Result.Success((ans, hist)) =>
+        assertEquals(ans, "round 2", "返回最后一轮的答案")
+        assertEquals(llm.seen.size, 2, "恰好调 2 次 LLM")
+        // hist 应包含两轮完整对话：Q + A1 + hint + A2
+        assertEquals(hist.size, 4)
+        assertEquals(hist.last, Message(Role.Assistant, "round 2"))
+      case other => fail(s"expected Success (best-effort), got $other")
+    }
+  }
+
+  test("loopWithReplay: maxRounds < 1 → Abort with IllegalArgumentException") {
+    val llm = new RecordingLLM(List.empty)
+    val r = runReplay(
+      llm,
+      TestTools,
+      List(Message(Role.User, "q")),
+      maxRounds = 0,
+      judge = (_, _) => None
+    )
+    r match {
+      case Result.Failure(e: IllegalArgumentException) =>
+        assert(
+          e.getMessage.contains("maxRounds must be >= 1"),
+          s"unexpected msg: ${e.getMessage}"
+        )
+        assertEquals(llm.seen.size, 0, "未进入 loop，LLM 不应被调")
+      case other => fail(s"expected IllegalArgumentException, got $other")
+    }
+  }
+
+  test(
+    "loopWithReplay: judge sees Assistant's final answer in history argument"
+  ) {
+    // 验证 judge 的 history 参数包含当前轮 Assistant 的终答——不是 LLM 调用前的 history
+    var captured: List[Message] = Nil
+    val llm = new RecordingLLM(List(LLMResponse.Answer("final")))
+    val r = runReplay(
+      llm,
+      TestTools,
+      List(Message(Role.User, "q")),
+      maxRounds = 2,
+      judge = (_, hist) => {
+        captured = hist
+        None
+      }
+    )
+    assert(r.isSuccess)
+    assertEquals(captured.last, Message(Role.Assistant, "final"),
+      "judge 看到的 history 末尾是本轮 Assistant 终答")
+  }
+
+  test(
+    "loopWithReplay: force-continue after LLM says Done (demo for the asked scenario)"
+  ) {
+    // 就是用户问的那个场景："LLM 说结束了，但我想继续 loop"。
+    // judge 无条件前 N 轮都注入，模拟"必须多问几次"的强制流程。
+    val llm = new RecordingLLM(
+      List(
+        LLMResponse.Answer("done"),          // 想结束
+        LLMResponse.Answer("still thinking"), // 被 judge 拉回第 2 轮
+        LLMResponse.Answer("really done")     // 第 3 轮 judge 放过
+      )
+    )
+    val round = new java.util.concurrent.atomic.AtomicInteger(0)
+    val r = runReplay(
+      llm,
+      TestTools,
+      List(Message(Role.User, "analyze")),
+      maxRounds = 3,
+      judge = (_, _) =>
+        val n = round.incrementAndGet()
+        if (n < 3) Some(Message(Role.User, s"continue round ${n + 1}"))
+        else None
+    )
+    r match {
+      case Result.Success((ans, _)) =>
+        assertEquals(ans, "really done")
+        assertEquals(llm.seen.size, 3, "judge 强制拉到第 3 轮")
+        assertEquals(round.get(), 3, "judge 被调用 3 次")
+      case other => fail(s"expected Success, got $other")
+    }
+  }
+
+  test("loopWithReplay: single-input overload delegates to history version") {
+    // 便捷 overload：等价于 history 版包一层 List(User(input))，只返回 String
+    val llm = new RecordingLLM(
+      List(
+        LLMResponse.Answer("short"),
+        LLMResponse.Answer("elaborated")
+      )
+    )
+    val handled: String < (IO & Abort[Throwable]) =
+      runSilent(
+        Agent
+          .loopWithReplay(
+            userInput = "q",
+            maxRounds = 2,
+            judge = (ans, _) =>
+              if (ans == "short") Some(Message(Role.User, "more")) else None
+          )
+          .pipe(HistoryRewrite.implIdentity(_))
+          .pipe(AgentHalt.implNever(_))
+          .pipe(ResponseHook.implIdentity(_))
+          .pipe(Tool.impl(TestTools))
+          .pipe(LLM.impl(llm))
+      )
+    val r = Abort.run[Throwable](IO.Unsafe.run(handled)).eval
+    r match {
+      case Result.Success(ans) =>
+        assertEquals(ans, "elaborated")
+        assertEquals(llm.seen.size, 2)
+        assertEquals(llm.seen(0).head, Message(Role.User, "q"))
+      case other => fail(s"expected Success, got $other")
+    }
+  }
+
+  test("loopWithReplay: tool calls cross replay rounds") {
+    // round 1：LLM 调 weather → Answer "短"；judge 注入 hint；
+    // round 2：LLM 又调 add → Answer "够了"。验证跨 round 的 tool 轨迹和 history 累积。
+    val llm = new RecordingLLM(
+      List(
+        LLMResponse.ToolCalls(
+          List(ToolInvocation("weather", Map("city" -> "Osaka")))
+        ),
+        LLMResponse.Answer("短"),
+        LLMResponse.ToolCalls(
+          List(ToolInvocation("add", Map("a" -> "1", "b" -> "2")))
+        ),
+        LLMResponse.Answer("够了")
+      )
+    )
+    val r = runReplay(
+      llm,
+      TestTools,
+      List(Message(Role.User, "q")),
+      maxRounds = 2,
+      judge = (ans, _) =>
+        if (ans == "短") Some(Message(Role.User, "再算一个"))
+        else None
+    )
+    r match {
+      case Result.Success((ans, hist)) =>
+        assertEquals(ans, "够了")
+        assertEquals(llm.seen.size, 4, "两轮 × 每轮 2 次 LLM (tool + answer)")
+        // round 2 的第一次 LLM 调用（llm.seen(2)）应该看到 round 1 的完整轨迹 + hint
+        val round2FirstHistory = llm.seen(2)
+        assert(
+          round2FirstHistory.exists(m =>
+            m.role == Role.Tool && m.content.contains("Osaka")
+          ),
+          s"round 2 应看到 round 1 的 weather tool 结果，got: $round2FirstHistory"
+        )
+        assertEquals(round2FirstHistory.last, Message(Role.User, "再算一个"))
+        // 终 history 同时包含两轮 tool 调用的痕迹
+        assert(hist.exists(_.content.contains("Osaka")))
+        assert(hist.exists(_.content == "3"), "add(1,2)=3 的结果必须在 history")
+        assertEquals(hist.last, Message(Role.Assistant, "够了"))
+      case other => fail(s"expected Success, got $other")
+    }
+  }
+
+  test("loopWithReplay: judge reads history to decide (not just ans)") {
+    // judge 基于 history 尾部 Tool 消息内容决策——验证 history 参数真的可用
+    val llm = new RecordingLLM(
+      List(
+        LLMResponse.ToolCalls(
+          List(ToolInvocation("weather", Map("city" -> "Shanghai")))
+        ),
+        LLMResponse.Answer("done"),
+        LLMResponse.Answer("verified")
+      )
+    )
+    val r = runReplay(
+      llm,
+      TestTools,
+      List(Message(Role.User, "q")),
+      maxRounds = 2,
+      judge = (_, hist) =>
+        // 只有 history 里见过 weather 工具结果才继续
+        if (
+          hist.exists(m =>
+            m.role == Role.Tool && m.content.contains("sunny")
+          )
+        ) Some(Message(Role.System, "double-check please"))
+        else None
+    )
+    r match {
+      case Result.Success((ans, _)) =>
+        assertEquals(ans, "verified")
+        assertEquals(llm.seen.size, 3, "round 1 两次 (tool + answer) + round 2 一次")
+      case other => fail(s"expected Success, got $other")
+    }
+  }
+
+  test("loopWithReplay: inner maxSteps exhaustion aborts outer replay") {
+    // 内层 Agent.loop 的 maxSteps 是硬 Abort——必须穿透外层 replay 不被吞
+    val llm = new RecordingLLM(
+      List.fill(10)(
+        LLMResponse.ToolCalls(
+          List(ToolInvocation("weather", Map("city" -> "X")))
+        )
+      )
+    )
+    val r = runReplay(
+      llm,
+      TestTools,
+      List(Message(Role.User, "q")),
+      maxRounds = 3,
+      judge = (_, _) => None,
+      innerMaxSteps = 2 // 强制首轮就撞墙
+    )
+    r match {
+      case Result.Failure(e: RuntimeException) =>
+        assert(
+          e.getMessage.contains("exceeded max steps"),
+          s"期望内层 maxSteps Abort 穿透，got: ${e.getMessage}"
+        )
+      case other => fail(s"expected inner maxSteps abort, got $other")
+    }
+  }
+
+  test("loopWithReplay: L4 HistoryRewrite.keepLast applies every round") {
+    // 验证 L4 handler 在 replay 每轮都生效——不是只在 round 1
+    val llm = new RecordingLLM(
+      List(
+        LLMResponse.Answer("r1"),
+        LLMResponse.Answer("r2")
+      )
+    )
+    // 起手给 5 条 history，keepLast(2) 每次应裁到 2 条
+    val init = (1 to 5).map(i => Message(Role.User, s"m$i")).toList
+    val handled: (String, List[Message]) < (IO & Abort[Throwable]) =
+      runSilent(
+        Agent
+          .loopWithReplay(
+            init,
+            maxRounds = 2,
+            judge = (ans, _) =>
+              if (ans == "r1") Some(Message(Role.User, "again")) else None,
+            innerMaxSteps = 2
+          )
+          .pipe(HistoryRewrite.implKeepLast(2)(_))
+          .pipe(AgentHalt.implNever(_))
+          .pipe(ResponseHook.implIdentity(_))
+          .pipe(Tool.impl(TestTools))
+          .pipe(LLM.impl(llm))
+      )
+    val r = Abort.run[Throwable](IO.Unsafe.run(handled)).eval
+    r match {
+      case Result.Success(_) =>
+        assertEquals(llm.seen.size, 2)
+        // round 1: 5 条 → keepLast(2) → ["m4", "m5"]
+        assertEquals(llm.seen(0).size, 2)
+        assertEquals(llm.seen(0).map(_.content), List("m4", "m5"))
+        // round 2: 6 条 (init5 + Assistant "r1" + hint "again") → keepLast(2) →
+        // [Assistant("r1"), User("again")]——keepLast 也在 round 2 生效
+        assertEquals(llm.seen(1).size, 2)
+        assertEquals(
+          llm.seen(1),
+          List(
+            Message(Role.Assistant, "r1"),
+            Message(Role.User, "again")
+          )
+        )
+      case other => fail(s"expected Success, got $other")
+    }
+  }
 }
