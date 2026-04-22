@@ -33,28 +33,28 @@ object ResponseHook {
     *
     * **三层角色**（source-level）：
     *   - **def**：`sealed trait ResponseHook extends ArrowEffect[...]`——效应契约（type）
-    *   - **invoke**：`def hook(r)`（本方法）——调用方，`ArrowEffect.suspend` 的 domain 动词封装
-    *   - **impl**：`def runIdentity` / `def runMap(f)`——handler 实现（策略）
+    *   - **invoke**：`def invoke(r)`（本方法）——调用方，`ArrowEffect.suspend` 的封装
+    *   - **impl**：`def implIdentity` / `def implMap(f)`——handler 实现（策略）
     */
-  inline def hook(r: LLMResponse)(using
+  inline def invoke(r: LLMResponse)(using
       inline frame: Frame,
       inline tag: Tag[ResponseHook]
   ): LLMResponse < ResponseHook =
     ArrowEffect.suspend[Any](tag, r)
 
-  /** Identity handler：透传，等价于"不启用 response 改写"。默认 wire。 */
-  inline def runIdentity[A, S](v: A < (ResponseHook & S))(using
+  /** **impl**（identity）：透传，等价于"不启用 response 改写"。默认 wire。 */
+  inline def implIdentity[A, S](v: A < (ResponseHook & S))(using
       inline frame: Frame,
       inline tag: Tag[ResponseHook]
   ): A < S =
     ArrowEffect.handle(tag, v)([C] => (r, cont) => cont(r))
 
-  /** Generic 变换：用户提供的 `LLMResponse => LLMResponse` 函数每次被应用到 LLM 返回值上。
+  /** **impl**（map）：generic 变换——用户提供的 `LLMResponse => LLMResponse` 函数每次被应用到 LLM 返回值上。
     *
-    * 特殊变换场景自己写 `f`。Framework 不提供 `runRewriteEmpty` / `runFilterTools`
+    * 特殊变换场景自己写 `f`。Framework 不提供 `implRewriteEmpty` / `implFilterTools`
     * 等预制 handler——消费者自己最清楚要改什么，framework 只提供接入点。
     */
-  inline def runMap[A, S](f: LLMResponse => LLMResponse)(
+  inline def implMap[A, S](f: LLMResponse => LLMResponse)(
       v: A < (ResponseHook & S)
   )(using
       inline frame: Frame,

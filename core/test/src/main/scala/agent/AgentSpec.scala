@@ -60,11 +60,11 @@ class AgentSpec extends munit.FunSuite {
   ): Result[Throwable, String] =
     Agent
       .loop(input, maxSteps)
-      .pipe(HistoryRewrite.runIdentity(_))
-      .pipe(AgentHalt.runNever(_))
-      .pipe(ResponseHook.runIdentity(_))
-      .pipe(Tool.run(registry))
-      .pipe(LLM.run(llm))
+      .pipe(HistoryRewrite.implIdentity(_))
+      .pipe(AgentHalt.implNever(_))
+      .pipe(ResponseHook.implIdentity(_))
+      .pipe(Tool.impl(registry))
+      .pipe(LLM.impl(llm))
       .pipe(runSilent(_))
       .pipe(IO.Unsafe.run(_))
       .pipe(Abort.run[Throwable](_))
@@ -350,11 +350,11 @@ class AgentSpec extends munit.FunSuite {
       runSilent(
         Agent
           .loop(initialHistory, maxSteps)
-          .pipe(HistoryRewrite.runIdentity(_))
-          .pipe(AgentHalt.runNever(_))
-          .pipe(ResponseHook.runIdentity(_))
-          .pipe(Tool.run(registry))
-          .pipe(LLM.run(llm))
+          .pipe(HistoryRewrite.implIdentity(_))
+          .pipe(AgentHalt.implNever(_))
+          .pipe(ResponseHook.implIdentity(_))
+          .pipe(Tool.impl(registry))
+          .pipe(LLM.impl(llm))
       )
     Abort.run[Throwable](IO.Unsafe.run(handled)).eval
   }
@@ -371,11 +371,11 @@ class AgentSpec extends munit.FunSuite {
       runSilent(
         Agent
           .loop(initialHistory, maxSteps)
-          .pipe(HistoryRewrite.runKeepLast(n)(_))
-          .pipe(AgentHalt.runNever(_))
-          .pipe(ResponseHook.runIdentity(_))
-          .pipe(Tool.run(registry))
-          .pipe(LLM.run(llm))
+          .pipe(HistoryRewrite.implKeepLast(n)(_))
+          .pipe(AgentHalt.implNever(_))
+          .pipe(ResponseHook.implIdentity(_))
+          .pipe(Tool.impl(registry))
+          .pipe(LLM.impl(llm))
       )
     Abort.run[Throwable](IO.Unsafe.run(handled)).eval
   }
@@ -392,11 +392,11 @@ class AgentSpec extends munit.FunSuite {
       runSilent(
         Agent
           .loop(initialHistory, maxSteps)
-          .pipe(HistoryRewrite.runIdentity(_))
-          .pipe(AgentHalt.runOn(guard)(_))
-          .pipe(ResponseHook.runIdentity(_))
-          .pipe(Tool.run(registry))
-          .pipe(LLM.run(llm))
+          .pipe(HistoryRewrite.implIdentity(_))
+          .pipe(AgentHalt.implOn(guard)(_))
+          .pipe(ResponseHook.implIdentity(_))
+          .pipe(Tool.impl(registry))
+          .pipe(LLM.impl(llm))
       )
     Abort.run[Throwable](IO.Unsafe.run(handled)).eval
   }
@@ -413,11 +413,11 @@ class AgentSpec extends munit.FunSuite {
       runSilent(
         Agent
           .loop(initialHistory, maxSteps)
-          .pipe(HistoryRewrite.runIdentity(_))
-          .pipe(AgentHalt.runNever(_))
-          .pipe(ResponseHook.runMap(f)(_))
-          .pipe(Tool.run(registry))
-          .pipe(LLM.run(llm))
+          .pipe(HistoryRewrite.implIdentity(_))
+          .pipe(AgentHalt.implNever(_))
+          .pipe(ResponseHook.implMap(f)(_))
+          .pipe(Tool.impl(registry))
+          .pipe(LLM.impl(llm))
       )
     Abort.run[Throwable](IO.Unsafe.run(handled)).eval
   }
@@ -634,7 +634,7 @@ class AgentSpec extends munit.FunSuite {
 
   // ====================== HistoryRewrite effect（L4 before_model hook）======================
 
-  test("HistoryRewrite.runIdentity: LLM sees full history unchanged") {
+  test("HistoryRewrite.implIdentity: LLM sees full history unchanged") {
     val llm = new RecordingLLM(List(LLMResponse.Answer("ok")))
     val existing = List(
       Message(Role.User, "q1"),
@@ -649,7 +649,7 @@ class AgentSpec extends munit.FunSuite {
     assertEquals(llm.seen.head, existing)
   }
 
-  test("HistoryRewrite.runKeepLast: LLM sees only tail n messages") {
+  test("HistoryRewrite.implKeepLast: LLM sees only tail n messages") {
     val llm = new RecordingLLM(List(LLMResponse.Answer("ok")))
     val ten = (1 to 10).map(i => Message(Role.User, s"msg $i")).toList
     val r = runLoopWithKeepLast(llm, TestTools, ten, n = 3)
@@ -666,7 +666,7 @@ class AgentSpec extends munit.FunSuite {
     )
   }
 
-  test("HistoryRewrite.runKeepLast: n >= history.size acts as identity") {
+  test("HistoryRewrite.implKeepLast: n >= history.size acts as identity") {
     val llm = new RecordingLLM(List(LLMResponse.Answer("ok")))
     val three = List(
       Message(Role.User, "a"),
@@ -679,7 +679,7 @@ class AgentSpec extends munit.FunSuite {
   }
 
   test(
-    "HistoryRewrite.runKeepLast: compaction semantics—returned history uses rewritten base"
+    "HistoryRewrite.implKeepLast: compaction semantics—returned history uses rewritten base"
   ) {
     // 关键语义：HistoryRewrite 是 compaction 而不是"仅 view"。
     // rewritten 成为 decideNext 的 history 基底，最终返回的 history 也基于它。
@@ -700,7 +700,7 @@ class AgentSpec extends munit.FunSuite {
 
   // ====================== AgentHalt effect（L4 goto='end' hook）======================
 
-  test("AgentHalt.runNever: never halts, identity to existing behavior") {
+  test("AgentHalt.implNever: never halts, identity to existing behavior") {
     val llm = new RecordingLLM(List(LLMResponse.Answer("normal ans")))
     val input = List(Message(Role.User, "q"))
     val r = runLoopWithHistory(llm, TestTools, input)
@@ -712,7 +712,7 @@ class AgentSpec extends munit.FunSuite {
     }
   }
 
-  test("AgentHalt.runOn: Some(reason) fires first turn → skips LLM entirely") {
+  test("AgentHalt.implOn: Some(reason) fires first turn → skips LLM entirely") {
     val llm = new RecordingLLM(List.empty)
     val input = List(Message(Role.User, "q"))
     val r = runLoopWithHalt(
@@ -730,7 +730,7 @@ class AgentSpec extends munit.FunSuite {
     }
   }
 
-  test("AgentHalt.runOn: guard re-evaluates each check, fires after N turns") {
+  test("AgentHalt.implOn: guard re-evaluates each check, fires after N turns") {
     // guard 捕获外部计数，第 3 次 check 时返回 Some
     val checks = new java.util.concurrent.atomic.AtomicInteger(0)
     def guard: Option[String] = {
@@ -788,11 +788,11 @@ class AgentSpec extends munit.FunSuite {
       runSilent(
         Agent
           .loop(ten, 6)
-          .pipe(HistoryRewrite.runKeepLast(2)(_))
-          .pipe(AgentHalt.runOn(Some("halted"))(_))
-          .pipe(ResponseHook.runIdentity(_))
-          .pipe(Tool.run(TestTools))
-          .pipe(LLM.run(llm))
+          .pipe(HistoryRewrite.implKeepLast(2)(_))
+          .pipe(AgentHalt.implOn(Some("halted"))(_))
+          .pipe(ResponseHook.implIdentity(_))
+          .pipe(Tool.impl(TestTools))
+          .pipe(LLM.impl(llm))
       )
     val r = Abort.run[Throwable](IO.Unsafe.run(handled)).eval
     r match {
@@ -808,7 +808,7 @@ class AgentSpec extends munit.FunSuite {
 
   // ====================== ResponseHook effect（L4 after_model hook）======================
 
-  test("ResponseHook.runIdentity: LLM response passes through unchanged") {
+  test("ResponseHook.implIdentity: LLM response passes through unchanged") {
     // 覆盖 Phase 3 的 identity path——通过 runLoopWithHistory 隐式验证（它 wire 了 runIdentity）
     val llm = new RecordingLLM(List(LLMResponse.Answer("raw")))
     val r = runLoopWithHistory(llm, TestTools, List(Message(Role.User, "q")))
@@ -818,7 +818,7 @@ class AgentSpec extends munit.FunSuite {
     }
   }
 
-  test("ResponseHook.runMap: transform Answer text") {
+  test("ResponseHook.implMap: transform Answer text") {
     // 把 Answer 的内容全部大写——verify f 作用到了 raw response
     val llm = new RecordingLLM(List(LLMResponse.Answer("hello")))
     val r = runLoopWithResponseMap(
@@ -837,7 +837,7 @@ class AgentSpec extends munit.FunSuite {
   }
 
   test(
-    "ResponseHook.runMap: can convert Answer to ToolCalls (force tool use)"
+    "ResponseHook.implMap: can convert Answer to ToolCalls (force tool use)"
   ) {
     // 展示 L4 after_model 的最大威力：改变控制流。
     // LLM 说"done"，handler 把它改写成 tool call，agent 继续执行工具。
@@ -875,7 +875,7 @@ class AgentSpec extends munit.FunSuite {
     }
   }
 
-  test("ResponseHook.runMap: filter invalid tool names") {
+  test("ResponseHook.implMap: filter invalid tool names") {
     // handler 过滤掉 LLM 幻觉出的不存在工具——只保留白名单
     val allowList = Set("weather", "add")
     val filterTools: LLMResponse => LLMResponse = {

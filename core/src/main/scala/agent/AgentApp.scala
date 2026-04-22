@@ -21,7 +21,7 @@ import scala.util.chaining.*
   * 不会自动 eta-expand，要写成 `.pipe(f(_))` 显式桥接。Kyo 的 effect handler 几乎都有
   * Frame context，都适用这一写法。
   *
-  * `Tool.run` / `LLM.run` 不在最外层 pipe，而是被 `Agent.repl` 内部 per-turn 应用——必要， 见
+  * `Tool.impl` / `LLM.impl` 不在最外层 pipe，而是被 `Agent.repl` 内部 per-turn 应用——必要， 见
   * AgentLoop.scala 的 repl docstring。
   */
 object AgentApp {
@@ -175,7 +175,7 @@ object AgentApp {
   def main(args: Array[String]): Unit = {
     println(banner)
 
-    // Agent.repl 的新 API：registry / llm 作为参数传入（而不是 pipe(Tool.run) / pipe(LLM.run)），
+    // Agent.repl 的新 API：registry / llm 作为参数传入（而不是 pipe(Tool.impl) / pipe(LLM.impl)），
     // 这样 per-turn 内能 discharge Abort，单 turn 失败不炸 session。
     //
     // Tool middleware 排布：errorHandling 在外、logging 在内——

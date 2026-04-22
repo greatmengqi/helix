@@ -38,18 +38,24 @@ sealed trait LLM extends ArrowEffect[Const[List[Message]], Const[LLMResponse]]
 
 object LLM {
 
-  /** raise 一次 LLM 调用：把 history 作为 suspended 计算抛出，等待上层 handler 给回 response。 */
-  inline def complete(history: List[Message])(using
+  /** **invoke**：raise 一次 LLM 调用——把 history 作为 suspended 计算抛出，等待上层 handler 给回 response。
+    *
+    * **三层角色**（source-level）：
+    *   - **def**：`sealed trait LLM extends ArrowEffect[...]`——效应契约（type）
+    *   - **invoke**：`def invoke(history)`（本方法）——调用方，`ArrowEffect.suspend` 的封装
+    *   - **impl**：`def impl(client)`——handler 实现（terminal handler，dispatch 到 Backend）
+    */
+  inline def invoke(history: List[Message])(using
       inline frame: Frame,
       inline tag: Tag[LLM]
   ): LLMResponse < LLM =
     ArrowEffect.suspend[Any](tag, history)
 
-  /** Terminal handler：把 LLM effect discharge 为对 client 的真实调用。 结果类型从
-    * `A < (LLM & S)` 变成 `A < (S & IO & Abort[Throwable])`—— LLM
-    * 消失，client.complete 引入 IO + Abort。
+  /** **impl**：terminal handler，把 LLM effect discharge 为对 `LLMClient` backend 的真实调用。
+    * 结果类型从 `A < (LLM & S)` 变成 `A < (S & IO & Abort[Throwable])`——LLM 消失，client.complete
+    * 引入 IO + Abort。
     */
-  inline def run[A, S](client: LLMClient)(v: A < (LLM & S))(using
+  inline def impl[A, S](client: LLMClient)(v: A < (LLM & S))(using
       inline frame: Frame,
       inline tag: Tag[LLM]
   ): A < (S & IO & Abort[Throwable]) =

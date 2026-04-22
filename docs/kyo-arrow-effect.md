@@ -9,7 +9,7 @@
 | 类别 | 成员 | Tool 示例 | LLM 示例 |
 |------|------|-----------|----------|
 | **强制 ①** | Effect marker trait | `sealed trait Tool extends ArrowEffect[Const[ToolInvocation], Const[String]]` | `sealed trait LLM extends ArrowEffect[Const[List[Message]], Const[LLMResponse]]` |
-| **强制 ②** | Companion object 的 suspend + handle | `Tool.call` / `Tool.run` | `LLM.complete` / `LLM.run` |
+| **强制 ②** | Companion object 的 suspend + handle | `Tool.invoke` / `Tool.impl` | `LLM.invoke` / `LLM.impl` |
 | **约定 ③** | Input 领域类型 | `case class ToolInvocation(name, args)` | 直接复用 `List[Message]` |
 | **约定 ④** | Backend trait | `trait ToolRegistry` | `trait LLMClient` |
 | **约定 ⑤** | Middleware | `ToolMiddleware` + `object ToolMiddleware` | `LLMMiddleware` + `object LLMMiddleware` |
@@ -37,7 +37,7 @@ sealed trait LLM extends ArrowEffect[Const[List[Message]], Const[LLMResponse]]
 **Suspension**（发射 effect）：
 
 ```scala
-inline def complete(history: List[Message])(using
+inline def invoke(history: List[Message])(using
     inline frame: Frame,
     inline tag: Tag[LLM]
 ): LLMResponse < LLM =
@@ -52,7 +52,7 @@ inline def complete(history: List[Message])(using
 **Terminal handler**（discharge effect）：
 
 ```scala
-inline def run[A, S](client: LLMClient)(v: A < (LLM & S))(using
+inline def impl[A, S](client: LLMClient)(v: A < (LLM & S))(using
     inline frame: Frame,
     inline tag: Tag[LLM]
 ): A < (S & Abort[Throwable]) =
@@ -107,13 +107,13 @@ trait ToolRegistry {
 ```
 用户代码       effect 定义层        backend impl
  ─────         ────────────        ───────────
-LLM.complete  ==(handle)==>  LLMClient.complete
+LLM.invoke    ==(handle)==>  LLMClient.complete
 ```
 
 为什么要这一层？直接在 handler 里硬编码也能工作，但抽成 trait 的好处：
 
-1. **多 impl 注入**：真实 LLM / mock / scripted / replay——`LLM.run(差异 client)` 切换
-2. **装饰器模式**（即 middleware）：`LLM.run(logging(retry(realClient)))`
+1. **多 impl 注入**：真实 LLM / mock / scripted / replay——`LLM.impl(差异 client)` 切换
+2. **装饰器模式**（即 middleware）：`LLM.impl(logging(retry(realClient)))`
 3. **依赖倒置**：effect 定义不耦合具体后端
 
 ### ⑤ Middleware（装饰器）
@@ -161,13 +161,13 @@ trait XBackend {
 // ② Suspension + terminal handler
 object X {
 
-  inline def call(inv: XInvocation)(using
+  inline def invoke(inv: XInvocation)(using
       inline frame: Frame,
       inline tag: Tag[X]
   ): XResult < X =
     ArrowEffect.suspend[Any](tag, inv)
 
-  inline def run[A, S](backend: XBackend)(v: A < (X & S))(using
+  inline def impl[A, S](backend: XBackend)(v: A < (X & S))(using
       inline frame: Frame,
       inline tag: Tag[X]
   ): A < (S & Abort[Throwable]) =
@@ -207,8 +207,8 @@ import scala.util.chaining.*
 val program: Unit < (X & Y & IO & Abort[Throwable]) = Agent.repl
 
 program
-  .pipe(X.run(xBackend.pipe(XMiddleware.logging)))   // 消 X，中间件栈 = logging
-  .pipe(Y.run(yBackend.pipe(YMiddleware.logging)))   // 消 Y
+  .pipe(X.impl(xBackend.pipe(XMiddleware.logging)))  // 消 X，中间件栈 = logging
+  .pipe(Y.impl(yBackend.pipe(YMiddleware.logging)))  // 消 Y
   .pipe(IO.Unsafe.run)                               // 消 IO
   .pipe(Abort.run[Throwable])                        // 消 Abort
   .eval                                              // 抽取 Result
@@ -217,7 +217,7 @@ program
 规则：
 
 1. **从里到外 discharge**：业务代码写成 `A < (X & Y & IO & Abort)`，handler 一层层剥皮
-2. **顺序无关（但结果类型有差）**：`X.run` 和 `Y.run` 可以交换，但最终类型会反映剩余 effect 的并集
+2. **顺序无关（但结果类型有差）**：`X.impl` 和 `Y.impl` 可以交换，但最终类型会反映剩余 effect 的并集
 3. **IO 和 Abort 通常最后**：因为 backend impl 里可能抛 Abort，IO 的不安全 run 通常是最外层入口
 
 ---

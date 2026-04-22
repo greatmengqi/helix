@@ -29,43 +29,43 @@ object HistoryRewrite {
 
   /** **invoke**：raise 一次 history 改写请求——把当前 history 交给 handler， 等回一个（可能被改写的）history。
     *
-    * handler 可以压缩、裁剪、注入 system 消息；透传（runIdentity）时行为不变。
+    * handler 可以压缩、裁剪、注入 system 消息；透传（implIdentity）时行为不变。
     *
     * **三层角色**（source-level）：
     *   - **def**：`sealed trait HistoryRewrite extends ArrowEffect[...]`——效应契约（type）
-    *   - **invoke**：`def rewrite(h)`（本方法）——调用方，`ArrowEffect.suspend` 的 domain 动词封装
-    *   - **impl**：`def runIdentity` / `def runKeepLast`——handler 实现（策略），每加一个 handler
-    *     就是一个新的 impl，不改 def 也不改 invoke
+    *   - **invoke**：`def invoke(h)`（本方法）——调用方，`ArrowEffect.suspend` 的封装
+    *   - **impl**：`def implIdentity` / `def implKeepLast`——handler 实现（策略），每加一个
+    *     handler 就是一个新的 impl，不改 def 也不改 invoke
     */
-  inline def rewrite(h: List[Message])(using
+  inline def invoke(h: List[Message])(using
       inline frame: Frame,
       inline tag: Tag[HistoryRewrite]
   ): List[Message] < HistoryRewrite =
     ArrowEffect.suspend[Any](tag, h)
 
-  /** Identity handler：透传，等价于"不启用改写"。
+  /** **impl**（identity）：透传，等价于"不启用改写"。
     *
     * 必须显式 wire——Kyo 不提供 ambient 默认 handler，这保证 opt-out 是显式选择、签名透明（看
     * `loop` 签名就知道带 `HistoryRewrite` 效应）。
     */
-  inline def runIdentity[A, S](v: A < (HistoryRewrite & S))(using
+  inline def implIdentity[A, S](v: A < (HistoryRewrite & S))(using
       inline frame: Frame,
       inline tag: Tag[HistoryRewrite]
   ): A < S =
     ArrowEffect.handle(tag, v)([C] => (h, cont) => cont(h))
 
-  /** 截断：只保留最后 n 条消息。
+  /** **impl**（keepLast）：截断，只保留最后 n 条消息。
     *
     * 适合长 session 防 LLM context 膨胀。deterministic 策略，无 LLM 调用。
     *
     * 极简形态——不区分角色、不特殊保留 system prompt。需要更复杂策略（始终保留首条、按
-    * token 预算截、按 role 过滤）请写独立 handler，这里保持 minimal。
+    * token 预算截、按 role 过滤）请写独立 impl，这里保持 minimal。
     *
     * 边界：
     *   - `n <= 0` → 返回 `Nil`（handler 行为透明；调用方若要保底自己控 n）
     *   - `n >= h.size` → 等价 identity
     */
-  inline def runKeepLast[A, S](n: Int)(v: A < (HistoryRewrite & S))(using
+  inline def implKeepLast[A, S](n: Int)(v: A < (HistoryRewrite & S))(using
       inline frame: Frame,
       inline tag: Tag[HistoryRewrite]
   ): A < S =

@@ -44,8 +44,8 @@ core/src/main/scala/agent/
 
 | 层 | Effect | Backend trait | Suspension | Handler | Middleware |
 |---|---|---|---|---|---|
-| Tool | `sealed trait Tool extends ArrowEffect[Const[ToolInvocation], Const[String]]` | `ToolRegistry` | `Tool.call(name, args)` | `Tool.run(registry)` | `ToolMiddleware = ToolRegistry => ToolRegistry` |
-| LLM | `sealed trait LLM extends ArrowEffect[Const[List[Message]], Const[LLMResponse]]` | `LLMClient` | `LLM.complete(history)` | `LLM.run(client)` | `LLMMiddleware = LLMClient => LLMClient` |
+| Tool | `sealed trait Tool extends ArrowEffect[Const[ToolInvocation], Const[String]]` | `ToolRegistry` | `Tool.invoke(name, args)` | `Tool.impl(registry)` | `ToolMiddleware = ToolRegistry => ToolRegistry` |
+| LLM | `sealed trait LLM extends ArrowEffect[Const[List[Message]], Const[LLMResponse]]` | `LLMClient` | `LLM.invoke(history)` | `LLM.impl(client)` | `LLMMiddleware = LLMClient => LLMClient` |
 
 **Backend trait 签名**：两侧 `call` / `complete` 都是 `... < (IO & Abort[Throwable])`——`IO` 是为 middleware 走 `kyo.Log` 留的通道。
 
@@ -53,21 +53,21 @@ core/src/main/scala/agent/
 
 | Effect | suspend 时机 | 对应 LangChain hook | 已落地 handler |
 |---|---|---|---|
-| `HistoryRewrite` | 每次 `LLM.complete` 之前 | `before_model` / `modify_model_request` | `runIdentity` / `runKeepLast(n)` |
-| `AgentHalt` | `HistoryRewrite` 之后、`LLM.complete` 之前 | `Command(goto='end')` | `runNever` / `runOn(guard)` |
-| `ResponseHook` | `LLM.complete` 之后、`decideNext` 之前 | `after_model` | `runIdentity` / `runMap(f)` |
+| `HistoryRewrite` | 每次 `LLM.invoke` 之前 | `before_model` / `modify_model_request` | `implIdentity` / `implKeepLast(n)` |
+| `AgentHalt` | `HistoryRewrite` 之后、`LLM.invoke` 之前 | `Command(goto='end')` | `implNever` / `implOn(guard)` |
+| `ResponseHook` | `LLM.invoke` 之后、`decideNext` 之前 | `after_model` | `implIdentity` / `implMap(f)` |
 
 **`AgentHalt` vs `maxSteps`**：`maxSteps` 是硬上限（超限 `Abort.fail`，调用方异常路径），`AgentHalt` 是软终止（`Loop.done` 返回 reason 作为 answer，正常路径）。两者正交共存。
 
-**L4 的 compaction 语义**（和 LangChain 共享）：`HistoryRewrite.rewrite(history)` 返回的 `rewritten` 成为当前 turn 的 history 基底——`decideNext` / `appendTurn` 都用 rewritten。若 handler 做了压缩，后续 session history 随之收敛，不是纯 view。
+**L4 的 compaction 语义**（和 LangChain 共享）：`HistoryRewrite.invoke(history)` 返回的 `rewritten` 成为当前 turn 的 history 基底——`decideNext` / `appendTurn` 都用 rewritten。若 handler 做了压缩，后续 session history 随之收敛，不是纯 view。
 
 **命名约定**（所有 ArrowEffect 通用的 **def / invoke / impl** 三层角色）：
 
 | 层 | 对应代码 | 职责 |
 |---|---|---|
 | **def** | `sealed trait Xxx extends ArrowEffect[Const[In], Const[Out]]` | 效应契约（type）——命名通道、钉死 in/out 类型 |
-| **invoke** | `object Xxx.<verb>(...)` — 如 `Tool.call` / `LLM.complete` / `HistoryRewrite.rewrite` / `AgentHalt.check` / `ResponseHook.hook` | 调用方（`ArrowEffect.suspend` 的 domain 动词封装）——业务代码"发起一次效应"的入口 |
-| **impl** | `object Xxx.run*(...)` — 如 `Tool.run` / `HistoryRewrite.runKeepLast` / `AgentHalt.runOn` / `ResponseHook.runMap` | 实现方（`ArrowEffect.handle` 的策略）——每加一个 handler 是加一个 impl，不改 def 也不改 invoke |
+| **invoke** | `object Xxx.invoke(...)` — 5 个 effect 统一用 `invoke`（`ArrowEffect.suspend` 的封装） | 调用方——业务代码"发起一次效应"的入口 |
+| **impl** | `object Xxx.impl(...)` / `object Xxx.implXxx(...)` — 如 `Tool.impl` / `HistoryRewrite.implKeepLast` / `AgentHalt.implOn` / `ResponseHook.implMap` | 实现方（`ArrowEffect.handle` 的策略）——每加一个 handler 是加一个 impl，不改 def 也不改 invoke |
 
 一个 effect 的 def 和 invoke 各只有一个（framework 作者写），impl 可以有 N 个（消费者按需写）。这正是"控制反转"在代数效应下的具象：**def + invoke 固定，impl 可替换 = 同一段业务代码在不同 wire 下展现不同行为**。
 
@@ -75,11 +75,11 @@ core/src/main/scala/agent/
 
 ```scala
 Agent.loop(...)
-  .pipe(HistoryRewrite.runKeepLast(20)(_))   // L4 改写
-  .pipe(AgentHalt.runOn(budgetGuard)(_))     // L4 早停
-  .pipe(ResponseHook.runMap(filterTools)(_)) // L4 response 改写
-  .pipe(Tool.run(registry))                  // L3 discharge
-  .pipe(LLM.run(llmClient))                  // L3 discharge
+  .pipe(HistoryRewrite.implKeepLast(20)(_))   // L4 改写
+  .pipe(AgentHalt.implOn(budgetGuard)(_))     // L4 早停
+  .pipe(ResponseHook.implMap(filterTools)(_)) // L4 response 改写
+  .pipe(Tool.impl(registry))                  // L3 discharge
+  .pipe(LLM.impl(llmClient))                  // L3 discharge
   ...
 ```
 
@@ -125,4 +125,4 @@ Agent.loop(...)
 11. **日志用 `kyo.Log`，不自己造 `Logger` trait**：`kyo.Log` 用 `Local[Log]` 实现（不是 ArrowEffect），调用点 `Log.info/error` 不污染效应签名只引入 `IO`。**不要再造 `trait Logger { def info(...): Unit }`**——已经踩过坑、已经迁移完。中间件不再持有 logger 实例参数，从环境取，最外层 wire `Log.withConsoleLogger(...)` 注入。SLF4J backend classpath 加一行就接入，业务零改动
 12. **Local vs ArrowEffect 的语义边界**：贯穿计算的"上下文配置"（logger、tracer、当前 user_id）适合 `Local[T]`——快速读，无 continuation 开销。每次都要被拦截/接管的"协议调用"（LLM、Tool、HTTP）适合 `ArrowEffect`。Kyo 的 Env / Local / ArrowEffect 三档代价递增，按粒度选
 13. **不抽 `chain` 函数组合 middleware**：`ToolMiddleware` / `LLMMiddleware` 本质是 `A => A`，stdlib `Function1.compose` 已经是 endomorphism monoid 的组合子，`scala.util.chaining.pipe` 给出应用语义。自建 `chain(mws*)` 只是 API 聚合（variadic sugar + 命名空间），**不引入新代数能力**。按"抽象必须区分什么 / 必须买到新能力"的原则删除。未来如果出现需要"middleware 栈作为一等值参与更大代数运算"（比如 `Monoid[Endo]` 参与环境配置合并），再引入也来得及——那时候是代数抽象，不是 API 聚合
-14. **`.pipe(f)` + Kyo handler 的 eta-expansion 坑**：Scala 3 不会自动把带 `using Frame` / context function 的方法 eta-expand 成 `A => B`。`Kyo` 的 effect handler（`IO.Unsafe.run` / `Abort.run[E]` / `Log.withConsoleLogger` / 自定义 `Tool.run(registry)` / `LLM.run(client)` 等）**几乎都有 Frame context**，所以 `.pipe(Log.withConsoleLogger)` 会编译报 `Found: Frame ?=> ... =>, Required: A =>` 之类的型错。**一律写 `.pipe(handler(_))`**——underscore 强制 eta-expand 成普通函数，Frame 从外层 scope 注入。这不是 pipe 的缺陷，是 Scala 3 context-function 类型和普通函数类型不互为 subtype 的直接后果
+14. **`.pipe(f)` + Kyo handler 的 eta-expansion 坑**：Scala 3 不会自动把带 `using Frame` / context function 的方法 eta-expand 成 `A => B`。`Kyo` 的 effect handler（`IO.Unsafe.run` / `Abort.run[E]` / `Log.withConsoleLogger` / 自定义 `Tool.impl(registry)` / `LLM.impl(client)` 等）**几乎都有 Frame context**，所以 `.pipe(Log.withConsoleLogger)` 会编译报 `Found: Frame ?=> ... =>, Required: A =>` 之类的型错。**一律写 `.pipe(handler(_))`**——underscore 强制 eta-expand 成普通函数，Frame 从外层 scope 注入。这不是 pipe 的缺陷，是 Scala 3 context-function 类型和普通函数类型不互为 subtype 的直接后果

@@ -60,7 +60,7 @@ L6  会话级         Session / memory / cross-run policy
 |---|---|---|
 | L1 | N/A | 本项目不涉及协议层 |
 | **L2** | ✅ | `ToolMiddleware` / `LLMMiddleware`（`A => A`，用 `compose` 组合，`pipe` 应用） |
-| **L3** | ✅ | `Tool.run` / `LLM.run`（`ArrowEffect.handle` 的 CPS 形态） |
+| **L3** | ✅ | `Tool.impl` / `LLM.impl`（`ArrowEffect.handle` 的 CPS 形态） |
 | L4 | ❌ | **缺口**。`Agent.loop` 里的状态转移（`Loop.done` / `Loop.continue` / `history ++ newMsgs`）写死在 body 里，外部不可注入 |
 | L5 | ❌ | Agent 是单一状态机，无图结构抽象 |
 | L6 | ❌ | 无 session policy / 长期记忆 |
@@ -71,7 +71,7 @@ L2 和 L3 合起来覆盖了"单次 backend call 的全部反转需求"。L4 的
 
 ## 三、L4 缺口的具体表现
 
-L2/L3 中间件能看到：一次 `LLM.complete` / `Tool.call` 的 in/out。
+L2/L3 中间件能看到：一次 `LLM.invoke` / `Tool.invoke` 的 in/out。
 
 L2/L3 中间件**看不到、干预不了**：
 
@@ -147,11 +147,11 @@ object HistoryRewrite:
     ArrowEffect.suspend[Any](Tag[HistoryRewrite], h)
 
   // 默认：透传
-  def runIdentity[A, S](v: A < (HistoryRewrite & S))(using Frame): A < S =
+  def implIdentity[A, S](v: A < (HistoryRewrite & S))(using Frame): A < S =
     ArrowEffect.handle(Tag[HistoryRewrite], v)([C] => (h, cont) => cont(h))
 
   // middleware：超阈值自动压缩（消费 LLM effect 生成 summary）
-  def runSummarize[A, S](threshold: Int)(v: A < (HistoryRewrite & S))(using Frame): A < (S & LLM) =
+  def implSummarize[A, S](threshold: Int)(v: A < (HistoryRewrite & S))(using Frame): A < (S & LLM) =
     ArrowEffect.handle(Tag[HistoryRewrite], v)([C] => (h, cont) =>
       if h.size > threshold then summarizeLLM(h).flatMap(cont)
       else cont(h))
@@ -163,10 +163,10 @@ object AgentHalt:
   def check()(using Frame, Tag[AgentHalt]): Option[String] < AgentHalt =
     ArrowEffect.suspend[Any](Tag[AgentHalt], ())
 
-  def runNever[A, S](v: A < (AgentHalt & S))(using Frame): A < S =
+  def implNever[A, S](v: A < (AgentHalt & S))(using Frame): A < S =
     ArrowEffect.handle(Tag[AgentHalt], v)([C] => (_, cont) => cont(None))
 
-  def runOn[A, S](guard: => Option[String])(v: A < (AgentHalt & S))(using Frame): A < S =
+  def implOn[A, S](guard: => Option[String])(v: A < (AgentHalt & S))(using Frame): A < S =
     ArrowEffect.handle(Tag[AgentHalt], v)([C] => (_, cont) => cont(guard))
 
 // 能力 3：suspend / resume hook（更重，和 Async 整合——待实装时设计）
@@ -183,14 +183,14 @@ def loop(initialHistory: List[Message], maxSteps: Int)
     initialHistory, maxSteps
   ) { (history, remaining) =>
     for {
-      rewritten <- HistoryRewrite.rewrite(history)     // 允许外部压缩 / 改写
-      halt      <- AgentHalt.check()                   // 允许外部请求早停
+      rewritten <- HistoryRewrite.invoke(history)     // 允许外部压缩 / 改写
+      halt      <- AgentHalt.invoke()                   // 允许外部请求早停
       outcome   <- halt match
         case Some(reason) =>
           Loop.done((reason, rewritten))
         case None =>
           for
-            response <- LLM.complete(rewritten)
+            response <- LLM.invoke(rewritten)
             decided  <- response match
               case Answer(t)       => Loop.done((t, rewritten :+ Msg(Assistant, t)))
               case ToolCalls(invs) => ...
@@ -206,18 +206,18 @@ def loop(initialHistory: List[Message], maxSteps: Int)
 ```scala
 // 最小配置：全 identity，等价于当前无 L4 的行为
 Agent.loop(...)
-  .pipe(HistoryRewrite.runIdentity(_))
-  .pipe(AgentHalt.runNever(_))
-  .pipe(Tool.run(registry)(_))
-  .pipe(LLM.run(llmClient)(_))
+  .pipe(HistoryRewrite.implIdentity(_))
+  .pipe(AgentHalt.implNever(_))
+  .pipe(Tool.impl(registry)(_))
+  .pipe(LLM.impl(llmClient)(_))
   ...
 
 // 启用具体 middleware：替换对应 effect 的 handler
 Agent.loop(...)
-  .pipe(HistoryRewrite.runSummarize(threshold = 20)(_))   // 超 20 条压缩
-  .pipe(AgentHalt.runOn(confidenceGuard)(_))              // 置信度够高时早停
-  .pipe(Tool.run(registry)(_))
-  .pipe(LLM.run(llmClient)(_))
+  .pipe(HistoryRewrite.implSummarize(threshold = 20)(_))   // 超 20 条压缩
+  .pipe(AgentHalt.implOn(confidenceGuard)(_))              // 置信度够高时早停
+  .pipe(Tool.impl(registry)(_))
+  .pipe(LLM.impl(llmClient)(_))
   ...
 ```
 
@@ -280,9 +280,9 @@ type HandlerTransform[E] = ... => ...  // 具体签名因 effect 而异
 ```scala
 // 串联：size 超 20 压缩 + 超 50 直接截断 + 每次打 log
 val composedRewrite = (v: A < (HistoryRewrite & S)) =>
-  v.pipe(HistoryRewrite.runSummarize(20)(_))
-   .pipe(HistoryRewrite.runTruncate(50)(_))
-   .pipe(HistoryRewrite.runLogging(_))
+  v.pipe(HistoryRewrite.implSummarize(20)(_))
+   .pipe(HistoryRewrite.implTruncate(50)(_))
+   .pipe(HistoryRewrite.implLogging(_))
 ```
 
 **组合机制**和 L2/L3 一致：`.pipe` 应用、`compose` 在需要"pipeline 作一等值"时使用。不需要新 API——stdlib 够用（参见决策 #13）。
@@ -292,7 +292,7 @@ val composedRewrite = (v: A < (HistoryRewrite & S)) =>
 - **机制**：L4 middleware 的底层机制就是 L3（`ArrowEffect.handle`）。**新的不是机制，是反转对象**——从 backend call 升级到 agent 状态转移。
 - **组合**：和 L2 middleware 同构，都用 `.pipe` 链式 wire。
 - **类型代价**：比 L2 重（要处理 continuation、tag、Frame），但比 LangChain Python 轻——Kyo 的 `ArrowEffect.handle` 把 CPS 的机械部分都封装好了。
-- **和 L2/L3 共存**：L4 effect 和 L2/L3 middleware 是**正交**的——`HistoryRewrite.runSummarize` 里面可以调 `LLM.complete`，而 `LLM.complete` 本身被 L2 middleware 装饰。两层互不干涉。
+- **和 L2/L3 共存**：L4 effect 和 L2/L3 middleware 是**正交**的——`HistoryRewrite.implSummarize` 里面可以调 `LLM.invoke`，而 `LLM.invoke` 本身被 L2 middleware 装饰。两层互不干涉。
 
 ---
 
@@ -324,8 +324,8 @@ val composedRewrite = (v: A < (HistoryRewrite & S)) =>
 
 可以**现在就做**的零成本预备：
 
-1. `Agent.loop` body 里的 `history ++ newMsgs` 提成命名函数 `appendTurn(history, results)`——方便未来提升为 `HistoryRewrite.rewrite(history)` suspend 点
-2. `Loop.done(...)` / `Loop.continue(...)` 的决策点抽成命名函数 `decideNext(response, ctx)`——方便未来插入 `AgentHalt.check()` 等 effect
+1. `Agent.loop` body 里的 `history ++ newMsgs` 提成命名函数 `appendTurn(history, results)`——方便未来提升为 `HistoryRewrite.invoke(history)` suspend 点
+2. `Loop.done(...)` / `Loop.continue(...)` 的决策点抽成命名函数 `decideNext(response, ctx)`——方便未来插入 `AgentHalt.invoke()` 等 effect
 3. **不**提前引入任何 L4 effect——哪怕只是一个 `AgentHalt`。正交小 effect 方案的前提是**每个 effect 都有真实消费者驱动**，没消费者的 effect 即使"只有一个 input/output"也是空抽象
 
 这是"不抽象但不堵死"的中间态，符合决策 #7 "等样本到位再抽"的精神。按 §5.1 的正交方案，新增一个 L4 能力的增量很小（加一个 `sealed trait` + identity handler + 具体 middleware handler），所以更没理由提前做。

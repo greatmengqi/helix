@@ -31,31 +31,31 @@ object AgentHalt {
     *
     * **三层角色**（source-level）：
     *   - **def**：`sealed trait AgentHalt extends ArrowEffect[...]`——效应契约（type）
-    *   - **invoke**：`def check()`（本方法）——调用方，`ArrowEffect.suspend` 的 domain 动词封装
-    *   - **impl**：`def runNever` / `def runOn(guard)`——handler 实现（策略）
+    *   - **invoke**：`def invoke()`（本方法）——调用方，`ArrowEffect.suspend` 的封装
+    *   - **impl**：`def implNever` / `def implOn(guard)`——handler 实现（策略）
     */
-  inline def check()(using
+  inline def invoke()(using
       inline frame: Frame,
       inline tag: Tag[AgentHalt]
   ): Option[String] < AgentHalt =
     ArrowEffect.suspend[Any](tag, ())
 
-  /** Identity handler：永不早停，等价于"不启用 halt 能力"。默认 wire。 */
-  inline def runNever[A, S](v: A < (AgentHalt & S))(using
+  /** **impl**（never）：永不早停，等价于"不启用 halt 能力"。默认 wire。 */
+  inline def implNever[A, S](v: A < (AgentHalt & S))(using
       inline frame: Frame,
       inline tag: Tag[AgentHalt]
   ): A < S =
     ArrowEffect.handle(tag, v)([C] => (_, cont) => cont(None))
 
-  /** 条件早停：每次 check 调用时重新求值 `guard`，`Some(reason)` 立即终止、`None` 继续。
+  /** **impl**（on）：条件早停——每次 invoke 调用时重新求值 `guard`，`Some(reason)` 立即终止、`None` 继续。
     *
     * `guard: => Option[String]` 是 by-name——handler 每次拦截都重新求值，所以 guard
     * 里读取的外部 state（`AtomicInteger.get()` / `AtomicBoolean.get()` / 时钟等）总是最新的。
     *
     * 不做"halted 后仍被调用"的二次保护——loop 在 `haltOpt = Some(...)` 分支就 `Loop.done`，
-    * 不会继续 check。
+    * 不会继续 invoke。
     */
-  def runOn[A, S](guard: => Option[String])(v: A < (AgentHalt & S))(using
+  def implOn[A, S](guard: => Option[String])(v: A < (AgentHalt & S))(using
       frame: Frame,
       tag: Tag[AgentHalt]
   ): A < S =

@@ -61,10 +61,10 @@ object Agent {
           for {
             // L4 before_model hook：handler 可改写 history（截断 / 压缩 / 注入 system）。
             // runIdentity 下 rewritten === history；runKeepLast(n) 下裁成尾部 n 条。
-            rewritten <- HistoryRewrite.rewrite(history)
+            rewritten <- HistoryRewrite.invoke(history)
             // L4 goto='end' hook：handler 返回 Some(reason) 则跳过 LLM 直接终止。
             // runNever 下永远 None，行为等价于不启用 halt；runOn(guard) 可按外部 state 决策。
-            haltOpt   <- AgentHalt.check()
+            haltOpt   <- AgentHalt.invoke()
             outcome   <- haltOpt match {
               case Some(reason) =>
                 // 早停：不调 LLM，用 rewritten 作为终态 history（compaction 一致性），
@@ -76,10 +76,10 @@ object Agent {
                 )
               case None =>
                 for {
-                  raw      <- LLM.complete(rewritten)
+                  raw      <- LLM.invoke(rewritten)
                   // L4 after_model hook：handler 可改写 LLM 返回值
                   // （空答案回落默认 / 过滤非法工具 / 强制工具调用）。
-                  response <- ResponseHook.hook(raw)
+                  response <- ResponseHook.invoke(raw)
                   // decideNext 用 rewritten 作为基底 append——若 handler 做了压缩，
                   // 后续 session history 也相应收敛（compaction 语义，而非纯 view）。
                   decided  <- decideNext(response, rewritten, remaining)
@@ -154,15 +154,15 @@ object Agent {
               for {
                 // Per-turn discharge：Tool.run / LLM.run 在 Abort.run 内层应用，让 Abort.run
                 // 的作用域能 catch 它们 handler 回调里 raise 的 Abort。三分支 match 决定下一步状态。
-                // repl 内部默认把所有 L4 effects 装配为 identity（HistoryRewrite.runIdentity /
-                // AgentHalt.runNever / ResponseHook.runIdentity）。需要 custom 策略的调用方
+                // repl 内部默认把所有 L4 effects 装配为 identity（HistoryRewrite.implIdentity /
+                // AgentHalt.implNever / ResponseHook.implIdentity）。需要 custom 策略的调用方
                 // 应该绕过 repl 自己写 runner，或等 repl overload 把 handler 暴露出来。
                 resultR <- loop(nextHistory, DefaultMaxSteps)
-                  .pipe(HistoryRewrite.runIdentity(_))
-                  .pipe(AgentHalt.runNever(_))
-                  .pipe(ResponseHook.runIdentity(_))
-                  .pipe(Tool.run(registry))
-                  .pipe(LLM.run(llm))
+                  .pipe(HistoryRewrite.implIdentity(_))
+                  .pipe(AgentHalt.implNever(_))
+                  .pipe(ResponseHook.implIdentity(_))
+                  .pipe(Tool.impl(registry))
+                  .pipe(LLM.impl(llm))
                   .pipe(Abort.run[Throwable](_))
                 pair = resultR match {
                   case Result.Success((a, h)) => (a, h)
@@ -216,7 +216,7 @@ object Agent {
     case LLMResponse.ToolCalls(invocations) =>
       Kyo
         .foreach(invocations) { inv =>
-          Tool.call(inv.name, inv.args).map(out => (inv, out))
+          Tool.invoke(inv.name, inv.args).map(out => (inv, out))
         }
         .map { results =>
           val newMsgs = results.toList.flatMap { case (inv, out) =>

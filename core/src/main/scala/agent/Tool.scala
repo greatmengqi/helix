@@ -32,20 +32,25 @@ trait ToolRegistry {
 
 object Tool {
 
-  /** raise 一次 Tool 调用：把 `ToolInvocation` 作为 suspended 计算抛出， 等待上层 handler 给回
-    * `String`。
+  /** **invoke**：raise 一次 Tool 调用——把 `ToolInvocation` 作为 suspended 计算抛出，
+    * 等待上层 handler 给回 `String`。
+    *
+    * **三层角色**（source-level）：
+    *   - **def**：`sealed trait Tool extends ArrowEffect[...]`——效应契约（type）
+    *   - **invoke**：`def invoke(name, args)`（本方法）——调用方，`ArrowEffect.suspend` 的封装
+    *   - **impl**：`def impl(registry)`——handler 实现（terminal handler，dispatch 到 Backend）
     */
-  inline def call(name: String, args: Map[String, String])(using
+  inline def invoke(name: String, args: Map[String, String])(using
       inline frame: Frame,
       inline tag: Tag[Tool]
   ): String < Tool =
     ArrowEffect.suspend[Any](tag, ToolInvocation(name, args))
 
-  /** Terminal handler：把 Tool effect discharge 为对 registry 的真实调用。 结果类型从
-    * `A < (Tool & S)` 变成 `A < (S & IO & Abort[Throwable])`—— Tool
-    * 消失，registry.call 引入 IO + Abort。
+  /** **impl**：terminal handler，把 Tool effect discharge 为对 `ToolRegistry`
+    * backend 的真实调用。结果类型从 `A < (Tool & S)` 变成 `A < (S & IO & Abort[Throwable])`——
+    * Tool 消失，registry.call 引入 IO + Abort。
     */
-  inline def run[A, S](registry: ToolRegistry)(v: A < (Tool & S))(using
+  inline def impl[A, S](registry: ToolRegistry)(v: A < (Tool & S))(using
       inline frame: Frame,
       inline tag: Tag[Tool]
   ): A < (S & IO & Abort[Throwable]) =
