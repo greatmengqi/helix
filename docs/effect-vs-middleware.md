@@ -10,10 +10,10 @@
 
 ## 一句话区分
 
-**Effect 增加一个"新的 suspend 点"（改变流程的能力）；Middleware 装饰一个"已有 backend 调用"（不改变能力，只加装饰）。**
+**Effect 增加一个"新的 suspend 点"（改变流程的能力）；Middleware 装饰 impl body 里那条 backend-dispatch 语句（不改变能力，只给那一步加装饰）。**
 
 - 加 effect → 改 `Agent.loop` 的效应签名、所有调用方要 wire 新的 impl
-- 加 middleware → 不动任何签名，只在 wire 时把 backend 套一层
+- 加 middleware → 不动任何签名，只在 wire 时把 backend 套一层，让 impl 里那一步调到的是被装饰过的 backend
 
 ---
 
@@ -23,7 +23,7 @@
 |---|---|---|
 | 代码形态 | `sealed trait X extends ArrowEffect[Const[In], Const[Out]]` | `type XMiddleware = Backend => Backend` |
 | 抽象层级 | **类型层**（`A < (X & ...)`，进签名） | **值层**（纯函数 endomorphism） |
-| 拦截对象 | effect 本身的 **suspend + continuation**（CPS 回调） | 一次 **backend 方法调用**的前后 |
+| 拦截对象 | effect 本身的 **suspend + continuation**（CPS 回调） | **impl body 里那条 backend-dispatch 语句**（如 `registry.call(...)`） |
 | 组合方式 | `.pipe(X.impl(...))`，类型层 `&` 并集 | `compose`（stdlib `Function1`），值层链 |
 | 签名可见度 | **改变** `Agent.loop` 的效应签名 | **不改**任何签名 |
 | 强制 wire | 是——不 wire 编译失败 | 否——不加能跑（只是缺装饰） |
@@ -47,10 +47,14 @@ sealed trait Tool extends ArrowEffect[Const[ToolInvocation], Const[String]]
 Tool.invoke(name, args): String < Tool
 
 // impl（terminal handler）
-Tool.impl(registry: ToolRegistry): A < (Tool & S) => A < (S & IO & Abort[Throwable])
+inline def impl[A, S](registry: ToolRegistry)(v: A < (Tool & S))(using ...) =
+  ArrowEffect.handle(tag, v)([C] => (input, cont) =>
+    registry.call(input.name, input.args).map(cont)
+    // ⭐ 这条语句 —— middleware 装饰的目标
+  )
 ```
 
-`Tool.impl` 内部把 effect 的 continuation 桥到 `ToolRegistry.call(name, args)` 这个 backend 方法——backend 怎么实现、有没有被装饰，effect 不关心。
+`Tool.impl` 的 handler body 里**有且只有一条**碰到 backend 的语句：`registry.call(...)`。这条语句的前后被 middleware 装饰。impl body 的其他部分（`ArrowEffect.handle` 的 CPS 机制、`cont` 的管理、tag 匹配）middleware **碰不到**。
 
 **ToolMiddleware**（L2 层）：
 
@@ -77,22 +81,54 @@ val wrapped: ToolRegistry =              // 还是个 ToolRegistry
   )(realRegistry)                        // 被装饰的"真"后端
 
 Agent.loop(...)
-  .pipe(Tool.impl(wrapped))              // Tool.impl 只看到 ToolRegistry 接口
-                                         // 无所谓传进来的是真后端还是被包 3 层的
+  .pipe(Tool.impl(wrapped))              // Tool.impl 里那条 registry.call(...)
+                                         // 实际调的是 wrapped.call(...)
+                                         //   = errorHandling 包住 logging 包住 retry 包住 realRegistry
 ```
 
-关键认知：`Tool.impl` 的类型签名**只认 `ToolRegistry` 接口**，middleware 装饰在它下面"隐身"。effect 层和 middleware 层是**正交的**——effect 层做"Tool 这个能力存在吗？怎么接入？"，middleware 层做"这次接入的 backend 要不要加 log / retry / cache？"
+**数据流细节**：
+
+```
+业务代码  Tool.invoke(name, args)                -- invoke 层（suspend）
+            ↓ CPS suspension
+effect 机制  ArrowEffect.suspend → handle([C] => ...)  -- Kyo runtime
+            ↓ 到达 impl body
+Tool.impl  registry.call(name, args)            -- ⭐ 这一步
+            ↓ 但 registry 实际是 wrapped
+middleware  errorHandling ─→ logging ─→ retry ─→ realRegistry.call  -- 层层装饰
+            ↓
+最底层    realRegistry.call(name, args)         -- 真实工具执行
+```
+
+关键认知：`Tool.impl` 的 handler body 里那一行 `registry.call(input.name, input.args)`，本身形式不变，但**被喂的 registry 是谁**由 wire 时决定。middleware 层做的就是"在 `Tool.impl` 调 `registry.call` 之前/之后插自己的逻辑"。
 
 ---
 
 ### L4 effects 为什么没有 middleware
 
-HistoryRewrite / AgentHalt / ResponseHook 都**没有**相应的 `XxxMiddleware` 类型。原因：
+HistoryRewrite / AgentHalt / ResponseHook 都**没有**相应的 `XxxMiddleware` 类型。原因用"middleware 装饰 impl 内某条语句"的视角更清晰：
 
-- Tool / LLM 有 **backend trait**（`ToolRegistry` / `LLMClient`），middleware 装饰的对象是这个 backend
-- L4 effects **直接在 impl 里写完整策略逻辑**，没有独立的 backend trait 可以装饰
+**L3 effect 的 impl body**（Tool / LLM）：
 
-想给 L4 加"装饰"行为？不用 middleware 抽象——直接写**新 impl**。例如：
+```scala
+ArrowEffect.handle(tag, v)([C] => (input, cont) =>
+  registry.call(input.name, input.args).map(cont)  // ⭐ 有一条外部 dispatch 语句
+)
+```
+
+有一条"喂给 external backend"的语句，这条语句可被装饰——所以存在 middleware 抽象。
+
+**L4 effect 的 impl body**（HistoryRewrite）：
+
+```scala
+ArrowEffect.handle(tag, v)([C] => (h, cont) =>
+  cont(h.takeRight(n))  // 整个 handler 就这一句——纯内部策略，没有外部 dispatch
+)
+```
+
+impl 本身**就是完整策略**，handler body 里没有"调用某个 backend 接口"的步骤——也就没有可装饰的点。想"装饰"？直接写一个**新 impl**（`implLoggedKeepLast` 在 cont 之前插日志再调 cont），不抽 middleware 层。
+
+具体"新 impl"的样子：
 
 ```scala
 // 想要"既截断又记日志"——不抽象 middleware，就是一个新 impl
@@ -105,7 +141,7 @@ def implLoggedKeepLast[A, S](n: Int)(v: A < (HistoryRewrite & S))
   )
 ```
 
-**判据**：有几个 impl 还少（当前每个 L4 effect 2 个），没必要提前抽 middleware 层。`kyo-middleware-ioc-layers.md` §5.5 讨论过"L4 middleware = handler transformer"——真要抽，也是等出现 **≥3 个独立关注点**（例如 log / metric / cache 都想横切加到 impl 上）再动手。
+**抽 middleware 的判据**：impl 的 handler body 里必须出现"可被装饰的外部 dispatch 语句"。当前 L4 effects 的 handler body 都是**闭合策略**（纯 `cont(...)` 调用），没可装饰的点，抽 middleware 是空抽象。`kyo-middleware-ioc-layers.md` §5.5 讨论的"L4 middleware = handler transformer"是**另一种**机制——操作 handler 本身而不是操作 backend，代价更重，当前不做。
 
 ---
 
